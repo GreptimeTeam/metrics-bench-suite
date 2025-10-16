@@ -29,6 +29,11 @@ type SampleLoader struct {
 	TagsPickRate   float32
 	TablePickCount uint64
 	Database       string
+	// fieldGeneratorsPerFile stores field generators for each series identified by file name and index combination
+	// Keyed by a composite key of file name and index pattern
+	fieldGeneratorsPerFile map[string]samples.FloatGenerator
+	// mutex to protect access to fieldGeneratorsPerFile map
+	fieldGeneratorsMutex sync.RWMutex
 }
 
 func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
@@ -104,6 +109,9 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 
 	log.Printf("Generating metrics...")
 
+	// Initialize field generators map
+	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
+
 	requestChan := make(chan prompb.WriteRequest, s.Workers)
 
 	wg := sync.WaitGroup{}
@@ -175,11 +183,20 @@ func worker(id int, url string, request <-chan prompb.WriteRequest, wg *sync.Wai
 	}
 }
 
+// SeriesWithIndex represents a series with its index position
+type SeriesWithIndex struct {
+	Series map[string]string
+	Index  []int
+}
+
 // TagSetPermutationStream generates permutations on-demand using a goroutine
-func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- map[string]string, totalCount *int) {
+func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- SeriesWithIndex, totalCount *int) {
 	defer close(permChan)
 	if len(labels) == 0 {
-		permChan <- make(map[string]string)
+		permChan <- SeriesWithIndex{
+			Series: make(map[string]string),
+			Index:  make([]int, 0),
+		}
 		*totalCount++
 		return
 	}
@@ -197,7 +214,10 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- m
 		for i, label := range labels {
 			series[label.Name] = label.Values[current[i]]
 		}
-		permChan <- series
+		permChan <- SeriesWithIndex{
+			Series: series,
+			Index:  append([]int(nil), current...), // copy the current index
+		}
 		*totalCount++
 
 		// Increment the combination like counting in base-n
@@ -235,7 +255,7 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 		}
 
 		// Create a channel for the permutations
-		permChan := make(chan map[string]string, 1)
+		permChan := make(chan SeriesWithIndex, 1)
 
 		// Start a goroutine to generate permutations
 		go func() {
@@ -246,7 +266,10 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 		field := fileConfig.Config.Fields[0]
 
 		// Process each series one by one
-		for series := range permChan {
+		for seriesWithIndex := range permChan {
+			series := seriesWithIndex.Series
+			index := seriesWithIndex.Index
+
 			// Create a single time series for this specific tag combination
 			ts := prompb.TimeSeries{
 				Labels:  make([]prompb.Label, 0),
@@ -268,10 +291,12 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 				})
 			}
 
-			// Create a field generator for this specific series
-			generator := field.Dist.FieldGenerator()
+			// Get or create a field generator for this specific series using the index
+			generator := s.getFieldGeneratorForFile(fileConfig.Name, index, field.Dist)
+			value := generator.Next()
+
 			ts.Samples = append(ts.Samples, prompb.Sample{
-				Value:     generator.Next(),
+				Value:     value,
 				Timestamp: current.UnixMilli(),
 			})
 
@@ -335,6 +360,37 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 			Timeseries: tsSet,
 		}
 	}
+}
+
+// convertIndexToKey converts a label index array to a string key for map indexing
+func convertIndexToKey(indices []int) string {
+	key := ""
+	for i, idx := range indices {
+		if i > 0 {
+			key += ","
+		}
+		key += fmt.Sprintf("%d", idx)
+	}
+	return key
+}
+
+// getFieldGeneratorForFile returns a field generator for a specific series in a file config, creating it if it doesn't exist
+func (s *SampleLoader) getFieldGeneratorForFile(fileName string, indices []int, dist samples.Distribution) samples.FloatGenerator {
+	s.fieldGeneratorsMutex.Lock()
+	defer s.fieldGeneratorsMutex.Unlock()
+
+	// Create a composite key from file name and indices
+	compositeKey := fileName + ":" + convertIndexToKey(indices)
+
+	// Check if generator already exists for this combination
+	if generator, exists := s.fieldGeneratorsPerFile[compositeKey]; exists {
+		return generator
+	}
+
+	// Create new generator and store it
+	generator := dist.FieldGenerator()
+	s.fieldGeneratorsPerFile[compositeKey] = generator
+	return generator
 }
 
 func NewCommand() *cobra.Command {
