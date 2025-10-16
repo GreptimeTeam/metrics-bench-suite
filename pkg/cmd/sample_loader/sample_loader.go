@@ -104,9 +104,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 
 	log.Printf("Generating metrics...")
 
-	ticker := time.NewTicker(s.TickInterval)
-	defer ticker.Stop()
-
 	requestChan := make(chan prompb.WriteRequest, s.Workers)
 
 	wg := sync.WaitGroup{}
@@ -119,6 +116,32 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if s.Infinite {
 		current = time.Now()
 	}
+
+	// Apply a one-time startup jitter in [0, tick_interval)
+	var jitter time.Duration
+	if s.TickInterval > 0 {
+		jitter = time.Duration(rand.Float64() * float64(s.TickInterval))
+	}
+	log.Printf("Startup jitter: %s", jitter)
+	if jitter > 0 {
+		time.Sleep(jitter)
+	}
+
+	// First generation immediately after jitter
+	log.Printf("Generating samples for %s", current)
+	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate)
+	current = current.Add(s.Interval)
+	if !s.Infinite {
+		if current.After(s.EndDate) {
+			log.Printf("End date reached, stopping")
+			close(requestChan)
+			wg.Wait()
+			return nil
+		}
+	}
+
+	ticker := time.NewTicker(s.TickInterval)
+	defer ticker.Stop()
 
 	for range ticker.C {
 		log.Printf("Generating samples for %s", current)
