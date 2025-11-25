@@ -7,12 +7,19 @@ import (
 	"math/rand/v2"
 	"metrics-bench-suite/pkg/http"
 	"metrics-bench-suite/pkg/samples"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/spf13/cobra"
 )
+
+// LabelPair represents an ordered label name and value pair
+type LabelPair struct {
+	Name  string
+	Value string
+}
 
 // SampleLoader is a tool that generate samples from config files and send them to the remote write endpoint.
 type SampleLoader struct {
@@ -28,7 +35,6 @@ type SampleLoader struct {
 	Infinite       bool
 	TagsPickRate   float32
 	TablePickCount uint64
-	Database       string
 	// fieldGeneratorsPerFile stores field generators for each series identified by file name and index combination
 	// Keyed by a composite key of file name and index pattern
 	fieldGeneratorsPerFile map[string]samples.FloatGenerator
@@ -86,10 +92,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	s.Database, err = cmd.Flags().GetString("database")
-	if err != nil {
-		return err
-	}
 	log.Printf("Start date: %s", s.StartDate)
 	log.Printf("End date: %s", s.EndDate)
 	log.Printf("Interval: %s", s.Interval)
@@ -97,7 +99,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	log.Printf("Config path: %s", s.ConfigPath)
 	log.Printf("Tags pick rate: %f", s.TagsPickRate)
 	log.Printf("Table pick rate: %d", s.TablePickCount)
-	log.Printf("Database: %s", s.Database)
 
 	fileConfigs, err := samples.WalkAndParseConfigWithMaxFileCount(s.ConfigPath, s.TablePickCount)
 	if err != nil {
@@ -185,7 +186,7 @@ func worker(id int, url string, request <-chan prompb.WriteRequest, wg *sync.Wai
 
 // SeriesWithIndex represents a series with its index position
 type SeriesWithIndex struct {
-	Series map[string]string
+	Series []LabelPair
 	Index  []int
 }
 
@@ -194,7 +195,7 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 	defer close(permChan)
 	if len(labels) == 0 {
 		permChan <- SeriesWithIndex{
-			Series: make(map[string]string),
+			Series: make([]LabelPair, 0),
 			Index:  make([]int, 0),
 		}
 		*totalCount++
@@ -210,9 +211,12 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 	// Generate all combinations
 	for {
 		// Create the current combination
-		series := make(map[string]string)
+		series := make([]LabelPair, 0, len(labels))
 		for i, label := range labels {
-			series[label.Name] = label.Values[current[i]]
+			series = append(series, LabelPair{
+				Name:  label.Name,
+				Value: label.Values[current[i]],
+			})
 		}
 		permChan <- SeriesWithIndex{
 			Series: series,
@@ -254,6 +258,11 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 			})
 		}
 
+		// Sort labels by name lexicographically to ensure consistent ordering
+		sort.Slice(labels, func(i, j int) bool {
+			return labels[i].Name < labels[j].Name
+		})
+
 		// Create a channel for the permutations
 		permChan := make(chan SeriesWithIndex, 1)
 
@@ -271,23 +280,25 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 			index := seriesWithIndex.Index
 
 			// Create a single time series for this specific tag combination
+			// Start with the __name__ label as the first label
 			ts := prompb.TimeSeries{
-				Labels:  make([]prompb.Label, 0),
+				Labels: []prompb.Label{
+					{
+						Name:  "__name__",
+						Value: fileConfig.Name,
+					},
+				},
 				Samples: make([]prompb.Sample, 0),
 			}
-			ts.Labels = append(ts.Labels, prompb.Label{
-				Name:  "__name__",
-				Value: fileConfig.Name,
-			})
-			for k, v := range series {
+			for _, labelPair := range series {
 				if pickRate < 1.0 {
 					if rand.Float32() > pickRate {
 						continue
 					}
 				}
 				ts.Labels = append(ts.Labels, prompb.Label{
-					Name:  k,
-					Value: v,
+					Name:  labelPair.Name,
+					Value: labelPair.Value,
 				})
 			}
 
@@ -299,14 +310,6 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 				Value:     value,
 				Timestamp: current.UnixMilli(),
 			})
-
-			// Add database label if specified
-			if s.Database != "" {
-				ts.Labels = append(ts.Labels, prompb.Label{
-					Name:  "database",
-					Value: s.Database,
-				})
-			}
 
 			// Send this single time series to the channel
 			timeSeriesChan <- ts
