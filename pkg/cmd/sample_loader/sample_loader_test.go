@@ -1,29 +1,30 @@
 package sample_loader
 
 import (
+	"fmt"
 	"metrics-bench-suite/pkg/samples"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
+
+	"github.com/prometheus/prometheus/prompb"
 )
 
 func TestTagSetPermutationStream(t *testing.T) {
 	// Test case 1: Empty labels
 	t.Run("Empty labels", func(t *testing.T) {
-		labels := []samples.LabelCandidates{}
-		permChan := make(chan map[string]string, 10)
+		var labels []samples.LabelCandidates
+		permChan := make(chan SeriesWithIndex, 10)
 		totalCount := 0
 
 		go TagSetPermutationStream(labels, permChan, &totalCount)
 
-		println("1")
-		results := make([]map[string]string, 0)
+		var results []SeriesWithIndex
 		for perm := range permChan {
-			println("2")
 			results = append(results, perm)
 		}
 
-		println("3")
 		expectedCount := 1
 		if totalCount != expectedCount {
 			t.Errorf("Expected total count %d, got %d", expectedCount, totalCount)
@@ -33,9 +34,8 @@ func TestTagSetPermutationStream(t *testing.T) {
 			t.Errorf("Expected 1 result, got %d", len(results))
 		}
 
-		expected := map[string]string{}
-		if !reflect.DeepEqual(results[0], expected) {
-			t.Errorf("Expected %v, got %v", expected, results[0])
+		if len(results[0].Series) != 0 {
+			t.Errorf("Expected empty series, got %v", results[0].Series)
 		}
 	})
 
@@ -47,12 +47,12 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"value1"},
 			},
 		}
-		permChan := make(chan map[string]string, 10)
+		permChan := make(chan SeriesWithIndex, 10)
 		totalCount := 0
 
 		go TagSetPermutationStream(labels, permChan, &totalCount)
 
-		results := make([]map[string]string, 0)
+		results := make([]SeriesWithIndex, 0)
 		for perm := range permChan {
 			results = append(results, perm)
 		}
@@ -66,9 +66,11 @@ func TestTagSetPermutationStream(t *testing.T) {
 			t.Errorf("Expected 1 result, got %d", len(results))
 		}
 
-		expected := map[string]string{"label1": "value1"}
-		if !reflect.DeepEqual(results[0], expected) {
-			t.Errorf("Expected %v, got %v", expected, results[0])
+		expectedSeries := []LabelPair{
+			{Name: "label1", Value: "value1"},
+		}
+		if !reflect.DeepEqual(results[0].Series, expectedSeries) {
+			t.Errorf("Expected %v, got %v", expectedSeries, results[0].Series)
 		}
 	})
 
@@ -80,12 +82,12 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"value1", "value2", "value3"},
 			},
 		}
-		permChan := make(chan map[string]string, 10)
+		permChan := make(chan SeriesWithIndex, 10)
 		totalCount := 0
 
 		go TagSetPermutationStream(labels, permChan, &totalCount)
 
-		results := make([]map[string]string, 0)
+		results := make([]SeriesWithIndex, 0)
 		for perm := range permChan {
 			results = append(results, perm)
 		}
@@ -99,18 +101,16 @@ func TestTagSetPermutationStream(t *testing.T) {
 			t.Errorf("Expected 3 results, got %d", len(results))
 		}
 
-		// Sort results for consistent comparison
-		sort.Slice(results, func(i, j int) bool {
-			return results[i]["label1"] < results[j]["label1"]
-		})
-
-		expected := []map[string]string{
-			{"label1": "value1"},
-			{"label1": "value2"},
-			{"label1": "value3"},
+		// Extract values for comparison
+		foundValues := make([]string, 0)
+		for _, result := range results {
+			foundValues = append(foundValues, result.Series[0].Value)
 		}
-		if !reflect.DeepEqual(results, expected) {
-			t.Errorf("Expected %v, got %v", expected, results)
+		sort.Strings(foundValues)
+
+		expectedValues := []string{"value1", "value2", "value3"}
+		if !reflect.DeepEqual(foundValues, expectedValues) {
+			t.Errorf("Expected values %v, got %v", expectedValues, foundValues)
 		}
 	})
 
@@ -126,12 +126,12 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"x", "y"},
 			},
 		}
-		permChan := make(chan map[string]string, 10)
+		permChan := make(chan SeriesWithIndex, 10)
 		totalCount := 0
 
 		go TagSetPermutationStream(labels, permChan, &totalCount)
 
-		results := make([]map[string]string, 0)
+		results := make([]SeriesWithIndex, 0)
 		for perm := range permChan {
 			results = append(results, perm)
 		}
@@ -145,22 +145,21 @@ func TestTagSetPermutationStream(t *testing.T) {
 			t.Errorf("Expected 4 results, got %d", len(results))
 		}
 
-		// Sort results for consistent comparison
-		sort.Slice(results, func(i, j int) bool {
-			if results[i]["label1"] != results[j]["label1"] {
-				return results[i]["label1"] < results[j]["label1"]
-			}
-			return results[i]["label2"] < results[j]["label2"]
-		})
-
-		expected := []map[string]string{
-			{"label1": "a", "label2": "x"},
-			{"label1": "a", "label2": "y"},
-			{"label1": "b", "label2": "x"},
-			{"label1": "b", "label2": "y"},
+		// Verify all combinations exist
+		var combinations []string
+		for _, result := range results {
+			combination := result.Series[0].Value + "," + result.Series[1].Value // label1 + "," + label2
+			combinations = append(combinations, combination)
 		}
-		if !reflect.DeepEqual(results, expected) {
-			t.Errorf("Expected %v, got %v", expected, results)
+
+		expectedCombinations := []string{
+			"a,x",
+			"b,x",
+			"a,y",
+			"b,y",
+		}
+		if !reflect.DeepEqual(combinations, expectedCombinations) {
+			t.Errorf("Expected %v, got %v", expectedCombinations, combinations)
 		}
 	})
 
@@ -180,12 +179,12 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"web"},
 			},
 		}
-		permChan := make(chan map[string]string, 100) // Larger buffer to handle all combinations
+		permChan := make(chan SeriesWithIndex, 100) // Larger buffer to handle all combinations
 		totalCount := 0
 
 		go TagSetPermutationStream(labels, permChan, &totalCount)
 
-		results := make([]map[string]string, 0)
+		results := make([]SeriesWithIndex, 0)
 		for perm := range permChan {
 			results = append(results, perm)
 		}
@@ -199,27 +198,143 @@ func TestTagSetPermutationStream(t *testing.T) {
 			t.Errorf("Expected 6 results, got %d", len(results))
 		}
 
-		// Sort results for consistent comparison
-		sort.Slice(results, func(i, j int) bool {
-			if results[i]["env"] != results[j]["env"] {
-				return results[i]["env"] < results[j]["env"]
-			}
-			if results[i]["region"] != results[j]["region"] {
-				return results[i]["region"] < results[j]["region"]
-			}
-			return results[i]["service"] < results[j]["service"]
-		})
-
-		expected := []map[string]string{
-			{"env": "dev", "region": "eu-west", "service": "web"},
-			{"env": "dev", "region": "us-east", "service": "web"},
-			{"env": "dev", "region": "us-west", "service": "web"},
-			{"env": "prod", "region": "eu-west", "service": "web"},
-			{"env": "prod", "region": "us-east", "service": "web"},
-			{"env": "prod", "region": "us-west", "service": "web"},
+		// Verify all combinations exist
+		var combinations []string
+		for _, result := range results {
+			combination := result.Series[0].Value + "," + result.Series[1].Value + "," + result.Series[2].Value
+			combinations = append(combinations, combination)
 		}
-		if !reflect.DeepEqual(results, expected) {
-			t.Errorf("Expected %v, got %v", expected, results)
+
+		expectedCombinations := []string{
+			"prod,us-east,web",
+			"dev,us-east,web",
+			"prod,us-west,web",
+			"dev,us-west,web",
+			"prod,eu-west,web",
+			"dev,eu-west,web",
+		}
+		if !reflect.DeepEqual(combinations, expectedCombinations) {
+			t.Errorf("Expected %v, got %v", expectedCombinations, combinations)
 		}
 	})
+}
+
+// TestGenerateTimeSeriesForFileConfig verifies that the generated time series meet the requirements:
+// 1. First label is always '__name__'
+// 2. All labels are sorted according to label name lexicographically
+func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
+	// Create a sample loader instance with Database field
+	s := &SampleLoader{}
+	// Initialize the fieldGeneratorsPerFile map to prevent nil pointer reference
+	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
+
+	// Create distribution values for the test
+	envValues := []samples.PresetItem{
+		{Value: "prod", Weight: 1},
+		{Value: "dev", Weight: 1},
+	}
+
+	regionValues := []samples.PresetItem{
+		{Value: "us-west", Weight: 1},
+		{Value: "us-east", Weight: 1},
+	}
+
+	serviceValues := []samples.PresetItem{
+		{Value: "web", Weight: 1},
+		{Value: "api", Weight: 1},
+	}
+
+	// Create a mock file config with tags
+	fileConfig := samples.FileConfig{
+		Name: "test_metric",
+		Config: samples.Config{
+			Tags: []samples.Tag{
+				{
+					Name: "region",
+					Dist: samples.Distribution{
+						Type:   "weighted_preset",
+						Preset: regionValues,
+					},
+				},
+				{
+					Name: "env",
+					Dist: samples.Distribution{
+						Type:   "weighted_preset",
+						Preset: envValues,
+					},
+				},
+				{
+					Name: "service",
+					Dist: samples.Distribution{
+						Type:   "weighted_preset",
+						Preset: serviceValues,
+					},
+				},
+			},
+			Fields: []samples.Field{
+				{
+					Name: "value",
+					Dist: samples.Distribution{
+						Type:       "uniform",
+						LowerBound: &[]float64{0.0}[0],
+						UpperBound: &[]float64{100.0}[0],
+					},
+				},
+			},
+		},
+	}
+
+	// Test with different pick rates to ensure consistency
+	for _, pickRate := range []float32{1.0, 0.5} {
+		pickRateStr := fmt.Sprintf("%.1f", pickRate)
+		t.Run("PickRate_"+pickRateStr, func(t *testing.T) {
+			currentTime := time.Now()
+			timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, pickRate)
+
+			// Collect all time series
+			timeSeries := make([]prompb.TimeSeries, 0)
+			for ts := range timeSeriesChan {
+				timeSeries = append(timeSeries, ts)
+			}
+
+			// Verify that there are time series generated
+			if len(timeSeries) == 0 {
+				t.Error("Expected at least one time series to be generated")
+				return
+			}
+
+			// For each time series, verify the requirements
+			for _, ts := range timeSeries {
+				// Check 1: First label is '__name__'
+				if len(ts.Labels) == 0 {
+					t.Error("Time series has no labels")
+					continue
+				}
+
+				if ts.Labels[0].Name != "__name__" {
+					t.Errorf("First label should be '__name__', got '%s'", ts.Labels[0].Name)
+				}
+
+				if ts.Labels[0].Value != "test_metric" {
+					t.Errorf("First label value should be 'test_metric', got '%s'", ts.Labels[0].Value)
+				}
+
+				// Check 2: Other labels (excluding __name__ and database if present) are sorted lexicographically
+				labelsAfterName := make([]prompb.Label, 0)
+				for _, label := range ts.Labels[1:] { // Skip the first __name__ label
+					if label.Name != "database" { // Exclude database label for sorting check
+						labelsAfterName = append(labelsAfterName, label)
+					}
+				}
+
+				// Verify labels are sorted lexicographically (excluding __name__ and database)
+				for i := 0; i < len(labelsAfterName)-1; i++ {
+					if labelsAfterName[i].Name > labelsAfterName[i+1].Name {
+						t.Errorf("Labels are not sorted lexicographically: '%s' > '%s'",
+							labelsAfterName[i].Name, labelsAfterName[i+1].Name)
+					}
+				}
+			}
+		})
+	}
 }
