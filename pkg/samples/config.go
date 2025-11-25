@@ -213,7 +213,7 @@ func (d Distribution) FieldGenerator() FloatGenerator {
 
 	switch distributionType {
 	case monoIncType:
-		return NewMonoInc(*d.Step)
+		return NewMonoInc(*d.Step, d.LowerBound, d.UpperBound)
 	case normalType:
 		return NewNormal(*d.Mean, *d.StdDev)
 	case randomIntType:

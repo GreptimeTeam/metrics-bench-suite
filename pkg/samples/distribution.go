@@ -23,22 +23,43 @@ type FloatGenerator interface {
 
 // MonoInc is a struct that represents a monotonically increasing float.
 type MonoInc struct {
-	step    int
-	current int
+	step       int
+	current    int
+	lowerBound *float64
+	upperBound *float64
 }
 
 // Next returns a monotonically increasing float.
 func (m *MonoInc) Next() float64 {
-	value := float64(m.current)
-	m.current += m.step
+	var value float64
+	if m.lowerBound != nil && m.current == 0 {
+		// If this is the first value and lowerBound is set, start from lowerBound
+		value = *m.lowerBound
+		m.current = int(*m.lowerBound)
+	} else {
+		value = float64(m.current)
+	}
+
+	// Increment for the next call
+	nextValue := m.current + m.step
+
+	// Check if next value is within bounds, if not reset to lower bound
+	if m.upperBound != nil && float64(nextValue) > *m.upperBound {
+		m.current = int(*m.lowerBound) // Reset to lower bound if upper bound would be exceeded
+	} else {
+		m.current = nextValue // Otherwise, update to next value
+	}
+
 	return value
 }
 
 // NewMonoInc creates a new MonoInc
-func NewMonoInc(step int) *MonoInc {
+func NewMonoInc(step int, lowerBound *float64, upperBound *float64) *MonoInc {
 	return &MonoInc{
-		step:    step,
-		current: 0,
+		step:       step,
+		current:    0,
+		lowerBound: lowerBound,
+		upperBound: upperBound,
 	}
 }
 
