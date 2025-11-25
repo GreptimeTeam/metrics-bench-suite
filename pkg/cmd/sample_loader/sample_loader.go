@@ -35,6 +35,7 @@ type SampleLoader struct {
 	Infinite       bool
 	TagsPickRate   float32
 	TablePickCount uint64
+	DryRun         bool
 	// fieldGeneratorsPerFile stores field generators for each series identified by file name and index combination
 	// Keyed by a composite key of file name and index pattern
 	fieldGeneratorsPerFile map[string]samples.FloatGenerator
@@ -64,9 +65,20 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	s.DryRun, err = cmd.Flags().GetBool("dry-run")
+	if err != nil {
+		return err
+	}
+
+	// Check for remote-write-url early, only required when not in dry-run mode
 	s.RemoteWriteURL, err = cmd.Flags().GetString("remote-write-url")
 	if err != nil {
 		return err
+	}
+
+	// Check if remote-write-url is required (not in dry-run mode)
+	if !s.DryRun && s.RemoteWriteURL == "" {
+		return fmt.Errorf("remote-write-url is required when not in dry-run mode")
 	}
 	s.MaxSamples, err = cmd.Flags().GetInt("max-samples")
 	if err != nil {
@@ -92,6 +104,21 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	s.DryRun, err = cmd.Flags().GetBool("dry-run")
+	if err != nil {
+		return err
+	}
+
+	// Check for remote-write-url early, only required when not in dry-run mode
+	s.RemoteWriteURL, err = cmd.Flags().GetString("remote-write-url")
+	if err != nil {
+		return err
+	}
+
+	// Check if remote-write-url is required (not in dry-run mode)
+	if !s.DryRun && s.RemoteWriteURL == "" {
+		return fmt.Errorf("remote-write-url is required when not in dry-run mode")
+	}
 	log.Printf("Start date: %s", s.StartDate)
 	log.Printf("End date: %s", s.EndDate)
 	log.Printf("Interval: %s", s.Interval)
@@ -99,6 +126,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	log.Printf("Config path: %s", s.ConfigPath)
 	log.Printf("Tags pick rate: %f", s.TagsPickRate)
 	log.Printf("Table pick rate: %d", s.TablePickCount)
+	log.Printf("Dry run: %t", s.DryRun)
 
 	fileConfigs, err := samples.WalkAndParseConfigWithMaxFileCount(s.ConfigPath, s.TablePickCount)
 	if err != nil {
@@ -118,7 +146,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	wg := sync.WaitGroup{}
 	for i := 0; i < s.Workers; i++ {
 		wg.Add(1)
-		go worker(i, s.RemoteWriteURL, requestChan, &wg)
+		go worker(i, s.RemoteWriteURL, requestChan, &wg, s.DryRun)
 	}
 
 	current := s.StartDate
@@ -170,17 +198,21 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func worker(id int, url string, request <-chan prompb.WriteRequest, wg *sync.WaitGroup) {
+func worker(id int, url string, request <-chan prompb.WriteRequest, wg *sync.WaitGroup, dryRun bool) {
 	defer wg.Done()
 	for request := range request {
 		numSeries := len(request.Timeseries)
-		now := time.Now()
-		r := http.NewRequester(url)
-		err := r.Send(request)
-		if err != nil {
-			log.Printf("worker %d failed to send write request: %v", id, err)
+		if dryRun {
+			log.Printf("worker %d (dry-run) would send request with num series: %d", id, numSeries)
+		} else {
+			now := time.Now()
+			r := http.NewRequester(url)
+			err := r.Send(request)
+			if err != nil {
+				log.Printf("worker %d failed to send write request: %v", id, err)
+			}
+			log.Printf("worker %d sent request in %s, num series: %d", id, time.Since(now), numSeries)
 		}
-		log.Printf("worker %d sent request in %s, num series: %d", id, time.Since(now), numSeries)
 	}
 }
 
@@ -421,6 +453,7 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().Float32P("tags-pick-rate", "p", 1.0, "The rate of the pick tags")
 	rootCmd.Flags().Uint64P("table-pick-count", "n", math.MaxUint64, "The number of tables to pick from")
 	rootCmd.Flags().StringP("database", "d", "", "The database name to add as a label to all metrics")
+	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")
 
 	return rootCmd
 }
