@@ -8,7 +8,7 @@ GOGET=$(GOCMD) get
 GOMOD=$(GOCMD) mod
 GOFMT=$(GOCMD) fmt
 
-.PHONY: all fmt lint
+.PHONY: all fmt lint docker-build-push
 
 BINS := $(patsubst ./cmd/%/main.go,%,$(wildcard ./cmd/*/main.go))
 
@@ -32,3 +32,12 @@ lint:
 
 go-lint:
 	golangci-lint run ./...
+
+# Docker build and push
+REGISTRY ?= greptime-registry.cn-hangzhou.cr.aliyuncs.com
+REPO ?= tools/ingester
+TAG ?= 0.2
+IMAGE_NAME := $(REGISTRY)/$(REPO):$(TAG)
+
+docker-build-push:
+	docker build -t $(IMAGE_NAME) . && docker push $(IMAGE_NAME)
