@@ -328,6 +328,10 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 						continue
 					}
 				}
+				// Filter out labels with empty values (not allowed in Prometheus Remote Write protocol)
+				if labelPair.Value == "" {
+					continue
+				}
 				ts.Labels = append(ts.Labels, prompb.Label{
 					Name:  labelPair.Name,
 					Value: labelPair.Value,
