@@ -14,7 +14,7 @@ func TestMonoIncBounds(t *testing.T) {
 
 	// Generate values, should cycle after reaching upper bound
 	expectedSequence := []float64{1, 11, 21, 1, 11} // After 21, it should wrap around to 1
-	
+
 	values := make([]float64, 5)
 	for i := 0; i < 5; i++ {
 		values[i] = gen.Next()
@@ -35,7 +35,7 @@ func TestMonoIncNoBounds(t *testing.T) {
 
 	// Generate first few values, should be 0, 5, 10, 15, ...
 	expectedSequence := []float64{0, 5, 10, 15}
-	
+
 	values := make([]float64, 4)
 	for i := 0; i < 4; i++ {
 		values[i] = gen.Next()
