@@ -41,7 +41,7 @@ type SampleLoader struct {
 	// churnEpoch tracks the current churn generation, incremented each ChurnInterval
 	churnEpoch int64
 	// churnMutex protects access to churnEpoch
-	churnMutex sync.Mutex
+	churnMutex sync.RWMutex
 	// fieldGeneratorsPerFile stores field generators for each series identified by file name and index combination
 	// Keyed by a composite key of file name and index pattern
 	fieldGeneratorsPerFile map[string]samples.FloatGenerator
@@ -130,6 +130,10 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	if s.ChurnRate < 0.0 || s.ChurnRate > 1.0 {
+		return fmt.Errorf("churn-rate must be between 0.0 and 1.0")
+	}
+
 	churnIntervalStr, _ := cmd.Flags().GetString("churn-interval")
 	s.ChurnInterval, err = time.ParseDuration(churnIntervalStr)
 	if err != nil {
@@ -187,8 +191,11 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	s.churnEpoch = 0
 
 	// First generation immediately after jitter
-	log.Printf("Generating samples for %s (churn epoch: %d)", current, s.churnEpoch)
-	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, s.churnEpoch)
+	s.churnMutex.RLock()
+	currentChurnEpoch := s.churnEpoch
+	s.churnMutex.RUnlock()
+	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
+	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, currentChurnEpoch)
 	current = current.Add(s.Interval)
 	if !s.Infinite {
 		if current.After(s.EndDate) {
@@ -323,8 +330,8 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 		permChan := make(chan SeriesWithIndex, 1)
 
 		// Start a goroutine to generate permutations
-		var totalCount int
 		go func() {
+			var totalCount int
 			TagSetPermutationStream(labels, permChan, &totalCount)
 		}()
 
@@ -415,13 +422,14 @@ func (s *SampleLoader) updateChurnEpoch(startTime time.Time) {
 	if s.ChurnInterval <= 0 || s.ChurnRate <= 0 {
 		return
 	}
-
-	s.churnMutex.Lock()
-	defer s.churnMutex.Unlock()
-
 	elapsed := time.Since(startTime)
+	s.churnMutex.RLock()
 	newEpoch := int64(elapsed / s.ChurnInterval)
+	s.churnMutex.RUnlock()
+
 	if newEpoch != s.churnEpoch {
+		s.churnMutex.Lock()
+		defer s.churnMutex.Unlock()
 		log.Printf("Churn epoch changed from %d to %d", s.churnEpoch, newEpoch)
 		s.churnEpoch = newEpoch
 	}
