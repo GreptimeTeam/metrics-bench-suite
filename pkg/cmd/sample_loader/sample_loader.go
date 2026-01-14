@@ -211,9 +211,9 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 
 	for range ticker.C {
 		// Update churn epoch based on elapsed time
-		s.updateChurnEpoch(startTime)
-		log.Printf("Generating samples for %s (churn epoch: %d)", current, s.churnEpoch)
-		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, s.churnEpoch)
+		currentChurnEpoch := s.updateChurnEpoch(startTime)
+		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
+		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, currentChurnEpoch)
 		current = current.Add(s.Interval)
 		if !s.Infinite {
 			if current.After(s.EndDate) {
@@ -418,20 +418,26 @@ func (s *SampleLoader) shouldChurn(seriesIdx int, churnRate float64) bool {
 }
 
 // updateChurnEpoch calculates and updates the current churn epoch based on elapsed time since start
-func (s *SampleLoader) updateChurnEpoch(startTime time.Time) {
+// and return the current churn epoch
+func (s *SampleLoader) updateChurnEpoch(startTime time.Time) int64 {
 	if s.ChurnInterval <= 0 || s.ChurnRate <= 0 {
-		return
+		return 0
 	}
 	elapsed := time.Since(startTime)
-	s.churnMutex.RLock()
 	newEpoch := int64(elapsed / s.ChurnInterval)
+	s.churnMutex.RLock()
+	currentEpoch := s.churnEpoch
 	s.churnMutex.RUnlock()
 
-	if newEpoch != s.churnEpoch {
-		s.churnMutex.Lock()
-		defer s.churnMutex.Unlock()
+	if newEpoch == currentEpoch {
+		// No change in churn epoch, return the current epoch
+		return currentEpoch
+	} else {
 		log.Printf("Churn epoch changed from %d to %d", s.churnEpoch, newEpoch)
+		s.churnMutex.Lock()
 		s.churnEpoch = newEpoch
+		s.churnMutex.Unlock()
+		return newEpoch
 	}
 }
 
