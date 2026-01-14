@@ -36,6 +36,14 @@ type SampleLoader struct {
 	TagsPickRate   float32
 	TablePickCount uint64
 	DryRun         bool
+	// ChurnRate is the fraction (0.0–1.0) of time series that will be churned at each churn event.
+	ChurnRate      float64
+	// ChurnInterval is the duration between churn events.
+	ChurnInterval  time.Duration
+	// churnEpoch tracks the current churn generation, incremented each ChurnInterval
+	churnEpoch int64
+	// churnMutex protects access to churnEpoch
+	churnMutex sync.RWMutex
 	// fieldGeneratorsPerFile stores field generators for each series identified by file name and index combination
 	// Keyed by a composite key of file name and index pattern
 	fieldGeneratorsPerFile map[string]samples.FloatGenerator
@@ -119,6 +127,20 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if !s.DryRun && s.RemoteWriteURL == "" {
 		return fmt.Errorf("remote-write-url is required when not in dry-run mode")
 	}
+
+	s.ChurnRate, err = cmd.Flags().GetFloat64("churn-rate")
+	if err != nil {
+		return err
+	}
+	if s.ChurnRate < 0.0 || s.ChurnRate > 1.0 {
+		return fmt.Errorf("churn-rate must be between 0.0 and 1.0")
+	}
+
+	churnIntervalStr, _ := cmd.Flags().GetString("churn-interval")
+	s.ChurnInterval, err = time.ParseDuration(churnIntervalStr)
+	if err != nil {
+		return err
+	}
 	log.Printf("Start date: %s", s.StartDate)
 	log.Printf("End date: %s", s.EndDate)
 	log.Printf("Interval: %s", s.Interval)
@@ -127,6 +149,8 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	log.Printf("Tags pick rate: %f", s.TagsPickRate)
 	log.Printf("Table pick rate: %d", s.TablePickCount)
 	log.Printf("Dry run: %t", s.DryRun)
+	log.Printf("Churn rate: %f", s.ChurnRate)
+	log.Printf("Churn interval: %s", s.ChurnInterval)
 
 	fileConfigs, err := samples.WalkAndParseConfigWithMaxFileCount(s.ConfigPath, s.TablePickCount)
 	if err != nil {
@@ -164,9 +188,16 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 		time.Sleep(jitter)
 	}
 
+	// Track start time for churn epoch calculation
+	startTime := time.Now()
+	s.churnEpoch = 0
+
 	// First generation immediately after jitter
-	log.Printf("Generating samples for %s", current)
-	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate)
+	s.churnMutex.RLock()
+	currentChurnEpoch := s.churnEpoch
+	s.churnMutex.RUnlock()
+	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
+	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, currentChurnEpoch)
 	current = current.Add(s.Interval)
 	if !s.Infinite {
 		if current.After(s.EndDate) {
@@ -181,8 +212,10 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		log.Printf("Generating samples for %s", current)
-		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate)
+		// Update churn epoch based on elapsed time
+		currentChurnEpoch := s.updateChurnEpoch(startTime)
+		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
+		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, currentChurnEpoch)
 		current = current.Add(s.Interval)
 		if !s.Infinite {
 			if current.After(s.EndDate) {
@@ -275,7 +308,7 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 }
 
 // generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
-func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileConfig, current time.Time, pickRate float32) <-chan prompb.TimeSeries {
+func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileConfig, current time.Time, pickRate float32, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
 
 	go func() {
@@ -300,11 +333,14 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 
 		// Start a goroutine to generate permutations
 		go func() {
-			totalCount := 0
+			var totalCount int
 			TagSetPermutationStream(labels, permChan, &totalCount)
 		}()
 
 		field := fileConfig.Config.Fields[0]
+
+		// Track series index for churn calculation
+		seriesIdx := 0
 
 		// Process each series one by one
 		for seriesWithIndex := range permChan {
@@ -338,8 +374,26 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 				})
 			}
 
+			// Apply churn: for series that fall within the churn rate percentage,
+			// add a churn_id label that changes with each epoch, creating new unique series
+			if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
+				churnLabel := prompb.Label{
+					Name:  "churn_id",
+					Value: fmt.Sprintf("epoch_%d", churnEpoch),
+				}
+				// Insert churn_id in sorted position (labels are already sorted, __name__ is first)
+				// Find the correct position to insert (after __name__, in alphabetical order)
+				insertIdx := 1 // Start after __name__
+				for insertIdx < len(ts.Labels) && ts.Labels[insertIdx].Name < churnLabel.Name {
+					insertIdx++
+				}
+				// Insert at the correct position
+				ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
+			}
+
 			// Get or create a field generator for this specific series using the index
-			generator := s.getFieldGeneratorForFile(fileConfig.Name, index, field.Dist)
+			// Include churn info in the key for churned series to get fresh generators
+			generator := s.getFieldGeneratorForFileWithChurn(fileConfig.Name, index, field.Dist, churnRate, churnEpoch, seriesIdx)
 			value := generator.Next()
 
 			ts.Samples = append(ts.Samples, prompb.Sample{
@@ -349,13 +403,47 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 
 			// Send this single time series to the channel
 			timeSeriesChan <- ts
+			seriesIdx++
 		}
 	}()
 
 	return timeSeriesChan
 }
 
-func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, maxSamples int, requestChan chan<- prompb.WriteRequest, pickRate float32) {
+// shouldChurn determines if a series at the given index should be churned based on the churn rate
+func (s *SampleLoader) shouldChurn(seriesIdx int, churnRate float64) bool {
+	// Use deterministic selection: series indices that fall within the churn percentage are churned
+	// This ensures consistent selection across generations
+	// We use modulo 10000 for finer granularity (supports churn rates down to 0.01%)
+	threshold := int(churnRate * 10000)
+	return (seriesIdx % 10000) < threshold
+}
+
+// updateChurnEpoch calculates and updates the current churn epoch based on elapsed time since start
+// and return the current churn epoch
+func (s *SampleLoader) updateChurnEpoch(startTime time.Time) int64 {
+	if s.ChurnInterval <= 0 || s.ChurnRate <= 0 {
+		return 0
+	}
+	elapsed := time.Since(startTime)
+	newEpoch := int64(elapsed / s.ChurnInterval)
+	s.churnMutex.RLock()
+	currentEpoch := s.churnEpoch
+	s.churnMutex.RUnlock()
+
+	if newEpoch == currentEpoch {
+		// No change in churn epoch, return the current epoch
+		return currentEpoch
+	} else {
+		log.Printf("Churn epoch changed from %d to %d", s.churnEpoch, newEpoch)
+		s.churnMutex.Lock()
+		s.churnEpoch = newEpoch
+		s.churnMutex.Unlock()
+		return newEpoch
+	}
+}
+
+func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, maxSamples int, requestChan chan<- prompb.WriteRequest, pickRate float32, churnRate float64, churnEpoch int64) {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -366,7 +454,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 		go func(fc samples.FileConfig) {
 			defer wg.Done()
 			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(fc, current, pickRate)
+			tsChan := s.generateTimeSeriesForFileConfig(fc, current, pickRate, churnRate, churnEpoch)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
 				timeSeriesChan <- ts
@@ -432,6 +520,29 @@ func (s *SampleLoader) getFieldGeneratorForFile(fileName string, indices []int, 
 	return generator
 }
 
+// getFieldGeneratorForFileWithChurn returns a field generator for a specific series, incorporating churn info for churned series
+func (s *SampleLoader) getFieldGeneratorForFileWithChurn(fileName string, indices []int, dist samples.Distribution, churnRate float64, churnEpoch int64, seriesIdx int) samples.FloatGenerator {
+	s.fieldGeneratorsMutex.Lock()
+	defer s.fieldGeneratorsMutex.Unlock()
+
+	// Create a composite key from file name and indices
+	// For churned series, include the epoch in the key so they get fresh generators each epoch
+	compositeKey := fileName + ":" + convertIndexToKey(indices)
+	if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
+		compositeKey = fmt.Sprintf("%s:churn:%d", compositeKey, churnEpoch)
+	}
+
+	// Check if generator already exists for this combination
+	if generator, exists := s.fieldGeneratorsPerFile[compositeKey]; exists {
+		return generator
+	}
+
+	// Create new generator and store it
+	generator := dist.FieldGenerator()
+	s.fieldGeneratorsPerFile[compositeKey] = generator
+	return generator
+}
+
 func NewCommand() *cobra.Command {
 	sampleLoader := &SampleLoader{}
 
@@ -458,6 +569,8 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().Uint64P("table-pick-count", "n", math.MaxUint64, "The number of tables to pick from")
 	rootCmd.Flags().StringP("database", "d", "", "The database name to add as a label to all metrics")
 	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")
+	rootCmd.Flags().Float64("churn-rate", 0.0, "The rate of time series to churn (0.0-1.0, e.g., 0.01 = 1%)")
+	rootCmd.Flags().String("churn-interval", "0s", "The interval at which churn occurs (e.g., 10m)")
 
 	return rootCmd
 }
