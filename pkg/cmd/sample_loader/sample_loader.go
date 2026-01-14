@@ -36,7 +36,9 @@ type SampleLoader struct {
 	TagsPickRate   float32
 	TablePickCount uint64
 	DryRun         bool
+	// ChurnRate is the fraction (0.0–1.0) of time series that will be churned at each churn event.
 	ChurnRate      float64
+	// ChurnInterval is the duration between churn events.
 	ChurnInterval  time.Duration
 	// churnEpoch tracks the current churn generation, incremented each ChurnInterval
 	churnEpoch int64
