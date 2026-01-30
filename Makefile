@@ -17,6 +17,8 @@ all: $(BINS)
 
 lint-all: fmt lint
 
+test:
+	$(GOTEST) -v ./...
 # Pattern rule to build each binary
 $(BINS):
 	$(GOGET) ./cmd/$@

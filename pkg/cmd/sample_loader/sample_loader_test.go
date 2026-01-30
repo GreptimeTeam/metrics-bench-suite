@@ -166,8 +166,6 @@ func TestTagSetPermutationStream(t *testing.T) {
 // 2. All labels are sorted according to label name lexicographically
 func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 	s := &SampleLoader{}
-	// Initialize the fieldGeneratorsPerFile map to prevent nil pointer reference
-	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
 
 	// Create distribution values for the test
 	envValues := []samples.PresetItem{
@@ -230,7 +228,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 		pickRateStr := fmt.Sprintf("%.1f", pickRate)
 		t.Run("PickRate_"+pickRateStr, func(t *testing.T) {
 			currentTime := time.Now()
-			timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, 0, 0)
+			timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0, 0)
 
 			// Collect all time series
 			timeSeries := make([]prompb.TimeSeries, 0)
@@ -287,7 +285,6 @@ func TestNewCommandDoesNotExposeDatabaseFlag(t *testing.T) {
 
 func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 	s := &SampleLoader{}
-	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
 
 	sampleLoaderValue := reflect.ValueOf(s).Elem()
 	replicaField := sampleLoaderValue.FieldByName("Replica")
@@ -354,7 +351,7 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 	replicaInsertField.SetInt(1)
 
 	currentTime := time.Now()
-	timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, 0, 0)
+	timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0, 0)
 
 	var timeSeries []prompb.TimeSeries
 	for ts := range timeSeriesChan {

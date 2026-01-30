@@ -18,8 +18,36 @@ type FileConfig struct {
 	Config             Config
 	TagOrder           []int
 	ReplicaInsertIndex int
+	// FieldGenerators caches field value generators per series key (and churn epoch when applicable).
+	// Populated at runtime; not serialized from YAML.
+	FieldGenerators map[string]FloatGenerator
 }
 
+// GetOrCreateFieldGenerator returns a field generator for the given indices, creating one from dist if needed.
+func (f *FileConfig) GetOrCreateFieldGenerator(indices []int, dist Distribution) FloatGenerator {
+	key := convertIndexToKey(indices)
+	if f.FieldGenerators == nil {
+		f.FieldGenerators = make(map[string]FloatGenerator)
+	}
+	if gen, exists := f.FieldGenerators[key]; exists {
+		return gen
+	}
+	gen := dist.FieldGenerator()
+	f.FieldGenerators[key] = gen
+	return gen
+}
+
+// convertIndexToKey converts a label index array to a string key for map indexing
+func convertIndexToKey(indices []int) string {
+	key := ""
+	for i, idx := range indices {
+		if i > 0 {
+			key += ","
+		}
+		key += fmt.Sprintf("%d", idx)
+	}
+	return key
+}
 func getFileNameWithoutExt(path string) string {
 	base := filepath.Base(path)
 	ext := filepath.Ext(base)

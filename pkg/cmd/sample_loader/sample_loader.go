@@ -45,11 +45,6 @@ type SampleLoader struct {
 	churnEpoch int64
 	// churnMutex protects access to churnEpoch
 	churnMutex sync.RWMutex
-	// fieldGeneratorsPerFile stores field generators for each series identified by file name and index combination
-	// Keyed by a composite key of file name and index pattern
-	fieldGeneratorsPerFile map[string]samples.FloatGenerator
-	// mutex to protect access to fieldGeneratorsPerFile map
-	fieldGeneratorsMutex sync.RWMutex
 }
 
 func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
@@ -162,9 +157,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	}
 
 	log.Printf("Generating metrics...")
-
-	// Initialize field generators map
-	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
 
 	requestChan := make(chan prompb.WriteRequest, s.Workers)
 
@@ -301,7 +293,7 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, fn func(SeriesWit
 }
 
 // generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
-func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
+func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig *samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
 	go func() {
 		defer close(timeSeriesChan)
@@ -311,7 +303,7 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 }
 
 // processFileConfig processes a single file config and sends generated time series to out.
-func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64, out chan<- prompb.TimeSeries) {
+func (s *SampleLoader) processFileConfig(fileConfig *samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64, out chan<- prompb.TimeSeries) {
 	tagOrder := fileConfig.TagOrder
 	if len(tagOrder) != len(fileConfig.Config.Tags) {
 		tagOrder = make([]int, len(fileConfig.Config.Tags))
@@ -358,7 +350,7 @@ func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current 
 // processSingleFileConfigSeries builds one TimeSeries for a single label-series from a file config
 // and sends it on out. seriesIdx is the 0-based index of this series in the permutation stream.
 func (s *SampleLoader) processSingleFileConfigSeries(
-	fileConfig samples.FileConfig,
+	fileConfig *samples.FileConfig,
 	seriesWithIndex SeriesWithIndex,
 	seriesIdx int,
 	replicaValue string,
@@ -417,7 +409,7 @@ func (s *SampleLoader) processSingleFileConfigSeries(
 		ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
 	}
 
-	generator := s.getFieldGeneratorForFileWithChurn(fileConfig.Name, index, field.Dist, churnRate, churnEpoch, seriesIdx)
+	generator := fileConfig.GetOrCreateFieldGenerator(index, field.Dist)
 	value := generator.Next()
 
 	ts.Samples = append(ts.Samples, prompb.Sample{
@@ -467,9 +459,9 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 
 	var wg sync.WaitGroup
 	// Start a goroutine for each file config
-	for _, fileConfig := range fileConfigs {
+	for i := range fileConfigs {
 		wg.Add(1)
-		go func(fc samples.FileConfig) {
+		go func(fc *samples.FileConfig) {
 			defer wg.Done()
 			// Get the time series channel for this file config
 			tsChan := s.generateTimeSeriesForFileConfig(fc, current, churnRate, churnEpoch)
@@ -477,7 +469,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 			for ts := range tsChan {
 				timeSeriesChan <- ts
 			}
-		}(fileConfig)
+		}(&fileConfigs[i])
 	}
 
 	// Close the main channel when all goroutines are done
@@ -505,41 +497,6 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 			Timeseries: tsSet,
 		}
 	}
-}
-
-// convertIndexToKey converts a label index array to a string key for map indexing
-func convertIndexToKey(indices []int) string {
-	key := ""
-	for i, idx := range indices {
-		if i > 0 {
-			key += ","
-		}
-		key += fmt.Sprintf("%d", idx)
-	}
-	return key
-}
-
-// getFieldGeneratorForFileWithChurn returns a field generator for a specific series, incorporating churn info for churned series
-func (s *SampleLoader) getFieldGeneratorForFileWithChurn(fileName string, indices []int, dist samples.Distribution, churnRate float64, churnEpoch int64, seriesIdx int) samples.FloatGenerator {
-	s.fieldGeneratorsMutex.Lock()
-	defer s.fieldGeneratorsMutex.Unlock()
-
-	// Create a composite key from file name and indices
-	// For churned series, include the epoch in the key so they get fresh generators each epoch
-	compositeKey := fileName + ":" + convertIndexToKey(indices)
-	if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
-		compositeKey = fmt.Sprintf("%s:churn:%d", compositeKey, churnEpoch)
-	}
-
-	// Check if generator already exists for this combination
-	if generator, exists := s.fieldGeneratorsPerFile[compositeKey]; exists {
-		return generator
-	}
-
-	// Create new generator and store it
-	generator := dist.FieldGenerator()
-	s.fieldGeneratorsPerFile[compositeKey] = generator
-	return generator
 }
 
 func NewCommand() *cobra.Command {
