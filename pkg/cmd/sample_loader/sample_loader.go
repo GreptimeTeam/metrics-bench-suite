@@ -34,7 +34,6 @@ type SampleLoader struct {
 	TickInterval   time.Duration
 	Workers        int
 	Infinite       bool
-	TagsPickRate   float32
 	TablePickCount uint64
 	DryRun         bool
 	Replica        int
@@ -106,10 +105,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	s.TagsPickRate, err = cmd.Flags().GetFloat32("tags-pick-rate")
-	if err != nil {
-		return err
-	}
 	s.TablePickCount, err = cmd.Flags().GetUint64("table-pick-count")
 	if err != nil {
 		return err
@@ -152,7 +147,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	log.Printf("Interval: %s", s.Interval)
 	log.Printf("Tick interval: %s", s.TickInterval)
 	log.Printf("Config path: %s", s.ConfigPath)
-	log.Printf("Tags pick rate: %f", s.TagsPickRate)
 	log.Printf("Table pick rate: %d", s.TablePickCount)
 	log.Printf("Replica label value: %d", s.Replica)
 	log.Printf("Dry run: %t", s.DryRun)
@@ -204,7 +198,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	currentChurnEpoch := s.churnEpoch
 	s.churnMutex.RUnlock()
 	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
-	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, currentChurnEpoch)
+	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.ChurnRate, currentChurnEpoch)
 	current = current.Add(s.Interval)
 	if !s.Infinite {
 		if current.After(s.EndDate) {
@@ -222,7 +216,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 		// Update churn epoch based on elapsed time
 		currentChurnEpoch := s.updateChurnEpoch(startTime)
 		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
-		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.TagsPickRate, s.ChurnRate, currentChurnEpoch)
+		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.ChurnRate, currentChurnEpoch)
 		current = current.Add(s.Interval)
 		if !s.Infinite {
 			if current.After(s.EndDate) {
@@ -307,17 +301,17 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, fn func(SeriesWit
 }
 
 // generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
-func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileConfig, current time.Time, pickRate float32, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
+func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
 	go func() {
 		defer close(timeSeriesChan)
-		s.processFileConfig(fileConfig, current, pickRate, churnRate, churnEpoch, timeSeriesChan)
+		s.processFileConfig(fileConfig, current, churnRate, churnEpoch, timeSeriesChan)
 	}()
 	return timeSeriesChan
 }
 
 // processFileConfig processes a single file config and sends generated time series to out.
-func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current time.Time, pickRate float32, churnRate float64, churnEpoch int64, out chan<- prompb.TimeSeries) {
+func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64, out chan<- prompb.TimeSeries) {
 	tagOrder := fileConfig.TagOrder
 	if len(tagOrder) != len(fileConfig.Config.Tags) {
 		tagOrder = make([]int, len(fileConfig.Config.Tags))
@@ -376,11 +370,6 @@ func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current 
 					Value: replicaValue,
 				})
 				replicaInserted = true
-			}
-			if pickRate < 1.0 {
-				if rand.Float32() > pickRate {
-					continue
-				}
 			}
 			if labelPair.Value == "" {
 				continue
@@ -455,7 +444,7 @@ func (s *SampleLoader) updateChurnEpoch(startTime time.Time) int64 {
 	}
 }
 
-func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, maxSamples int, requestChan chan<- prompb.WriteRequest, pickRate float32, churnRate float64, churnEpoch int64) {
+func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, maxSamples int, requestChan chan<- prompb.WriteRequest, churnRate float64, churnEpoch int64) {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -466,7 +455,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 		go func(fc samples.FileConfig) {
 			defer wg.Done()
 			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(fc, current, pickRate, churnRate, churnEpoch)
+			tsChan := s.generateTimeSeriesForFileConfig(fc, current, churnRate, churnEpoch)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
 				timeSeriesChan <- ts
@@ -559,7 +548,6 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().IntP("workers", "w", 1, "The number of workers to send requests")
 	rootCmd.Flags().IntP("replica", "r", 0, "The replica tab value of current instance")
 	rootCmd.Flags().BoolP("infinite", "i", false, "Run indefinitely")
-	rootCmd.Flags().Float32P("tags-pick-rate", "p", 1.0, "The rate of the pick tags")
 	rootCmd.Flags().Uint64P("table-pick-count", "n", math.MaxUint64, "The number of tables to pick from")
 	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")
 	rootCmd.Flags().Float64("churn-rate", 0.0, "The rate of time series to churn (0.0-1.0, e.g., 0.01 = 1%)")
