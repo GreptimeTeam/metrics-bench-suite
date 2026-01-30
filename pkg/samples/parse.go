@@ -24,7 +24,7 @@ type FileConfig struct {
 }
 
 // GetOrCreateFieldGenerator returns a field generator for the given indices, creating one from dist if needed.
-func (f *FileConfig) GetOrCreateFieldGenerator(indices []int, dist Distribution) FloatGenerator {
+func (f *FileConfig) GetOrCreateFieldGenerator(indices []int) FloatGenerator {
 	key := convertIndexToKey(indices)
 	if f.FieldGenerators == nil {
 		f.FieldGenerators = make(map[string]FloatGenerator)
@@ -32,7 +32,7 @@ func (f *FileConfig) GetOrCreateFieldGenerator(indices []int, dist Distribution)
 	if gen, exists := f.FieldGenerators[key]; exists {
 		return gen
 	}
-	gen := dist.FieldGenerator()
+	gen := f.Config.Fields[0].Dist.FieldGenerator()
 	f.FieldGenerators[key] = gen
 	return gen
 }

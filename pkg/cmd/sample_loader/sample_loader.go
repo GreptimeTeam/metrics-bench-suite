@@ -190,7 +190,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	currentChurnEpoch := s.churnEpoch
 	s.churnMutex.RUnlock()
 	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
-	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.ChurnRate, currentChurnEpoch)
+	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentChurnEpoch)
 	current = current.Add(s.Interval)
 	if !s.Infinite {
 		if current.After(s.EndDate) {
@@ -208,7 +208,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 		// Update churn epoch based on elapsed time
 		currentChurnEpoch := s.updateChurnEpoch(startTime)
 		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
-		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, s.MaxSamples, requestChan, s.ChurnRate, currentChurnEpoch)
+		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentChurnEpoch)
 		current = current.Add(s.Interval)
 		if !s.Infinite {
 			if current.After(s.EndDate) {
@@ -293,17 +293,17 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, fn func(SeriesWit
 }
 
 // generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
-func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig *samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
+func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig *samples.FileConfig, current time.Time, churnEpoch int64) <-chan prompb.TimeSeries {
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
 	go func() {
 		defer close(timeSeriesChan)
-		s.processFileConfig(fileConfig, current, churnRate, churnEpoch, timeSeriesChan)
+		s.processFileConfig(fileConfig, current, churnEpoch, timeSeriesChan)
 	}()
 	return timeSeriesChan
 }
 
 // processFileConfig processes a single file config and sends generated time series to out.
-func (s *SampleLoader) processFileConfig(fileConfig *samples.FileConfig, current time.Time, churnRate float64, churnEpoch int64, out chan<- prompb.TimeSeries) {
+func (s *SampleLoader) processFileConfig(fileConfig *samples.FileConfig, current time.Time, churnEpoch int64, out chan<- prompb.TimeSeries) {
 	tagOrder := fileConfig.TagOrder
 	if len(tagOrder) != len(fileConfig.Config.Tags) {
 		tagOrder = make([]int, len(fileConfig.Config.Tags))
@@ -325,10 +325,7 @@ func (s *SampleLoader) processFileConfig(fileConfig *samples.FileConfig, current
 		})
 	}
 
-	field := fileConfig.Config.Fields[0]
-
 	seriesIdx := 0
-	replicaValue := strconv.Itoa(s.Replica)
 	replicaInsertIndex := fileConfig.ReplicaInsertIndex
 	if len(fileConfig.TagOrder) != len(fileConfig.Config.Tags) || replicaInsertIndex < 0 || replicaInsertIndex > len(tagOrder) {
 		replicaInsertIndex = 0
@@ -342,7 +339,8 @@ func (s *SampleLoader) processFileConfig(fileConfig *samples.FileConfig, current
 	}
 
 	TagSetPermutationStream(labels, func(seriesWithIndex SeriesWithIndex) {
-		s.processSingleFileConfigSeries(fileConfig, seriesWithIndex, seriesIdx, replicaValue, replicaInsertIndex, field, current, churnRate, churnEpoch, out)
+		ts := s.processSingleFileConfigSeries(fileConfig, seriesWithIndex, seriesIdx, replicaInsertIndex, current, churnEpoch)
+		out <- ts
 		seriesIdx++
 	})
 }
@@ -353,14 +351,10 @@ func (s *SampleLoader) processSingleFileConfigSeries(
 	fileConfig *samples.FileConfig,
 	seriesWithIndex SeriesWithIndex,
 	seriesIdx int,
-	replicaValue string,
 	replicaInsertIndex int,
-	field samples.Field,
 	current time.Time,
-	churnRate float64,
 	churnEpoch int64,
-	out chan<- prompb.TimeSeries,
-) {
+) prompb.TimeSeries {
 	series := seriesWithIndex.Series
 	index := seriesWithIndex.Index
 
@@ -373,6 +367,7 @@ func (s *SampleLoader) processSingleFileConfigSeries(
 		},
 		Samples: make([]prompb.Sample, 0),
 	}
+	replicaValue := strconv.Itoa(s.Replica)
 	replicaInserted := false
 	for labelIndex, labelPair := range series {
 		if labelIndex == replicaInsertIndex {
@@ -397,7 +392,7 @@ func (s *SampleLoader) processSingleFileConfigSeries(
 		})
 	}
 
-	if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
+	if s.ChurnRate > 0 && shouldChurn(seriesIdx, s.ChurnRate) {
 		churnLabel := prompb.Label{
 			Name:  "churn_id",
 			Value: fmt.Sprintf("epoch_%d", churnEpoch),
@@ -409,19 +404,18 @@ func (s *SampleLoader) processSingleFileConfigSeries(
 		ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
 	}
 
-	generator := fileConfig.GetOrCreateFieldGenerator(index, field.Dist)
+	generator := fileConfig.GetOrCreateFieldGenerator(index)
 	value := generator.Next()
 
 	ts.Samples = append(ts.Samples, prompb.Sample{
 		Value:     value,
 		Timestamp: current.UnixMilli(),
 	})
-
-	out <- ts
+	return ts
 }
 
 // shouldChurn determines if a series at the given index should be churned based on the churn rate
-func (s *SampleLoader) shouldChurn(seriesIdx int, churnRate float64) bool {
+func shouldChurn(seriesIdx int, churnRate float64) bool {
 	// Use deterministic selection: series indices that fall within the churn percentage are churned
 	// This ensures consistent selection across generations
 	// We use modulo 10000 for finer granularity (supports churn rates down to 0.01%)
@@ -453,7 +447,7 @@ func (s *SampleLoader) updateChurnEpoch(startTime time.Time) int64 {
 	}
 }
 
-func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, maxSamples int, requestChan chan<- prompb.WriteRequest, churnRate float64, churnEpoch int64) {
+func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -464,7 +458,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 		go func(fc *samples.FileConfig) {
 			defer wg.Done()
 			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(fc, current, churnRate, churnEpoch)
+			tsChan := s.generateTimeSeriesForFileConfig(fc, current, churnEpoch)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
 				timeSeriesChan <- ts
@@ -479,15 +473,15 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 	}()
 
 	// Collect time series and send in batches
-	tsSet := make([]prompb.TimeSeries, 0, maxSamples)
+	tsSet := make([]prompb.TimeSeries, 0, s.MaxSamples)
 	for ts := range timeSeriesChan {
 		tsSet = append(tsSet, ts)
-		if len(tsSet) >= maxSamples {
+		if len(tsSet) >= s.MaxSamples {
 			// Send a batch when we reach maxSamples
 			requestChan <- prompb.WriteRequest{
 				Timeseries: tsSet,
 			}
-			tsSet = make([]prompb.TimeSeries, 0, maxSamples) // Reset the slice
+			tsSet = make([]prompb.TimeSeries, 0, s.MaxSamples) // Reset the slice
 		}
 	}
 
