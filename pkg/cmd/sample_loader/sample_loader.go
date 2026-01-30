@@ -8,6 +8,7 @@ import (
 	"metrics-bench-suite/pkg/http"
 	"metrics-bench-suite/pkg/samples"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -36,6 +37,7 @@ type SampleLoader struct {
 	TagsPickRate   float32
 	TablePickCount uint64
 	DryRun         bool
+	Replica        int
 	// ChurnRate is the fraction (0.0–1.0) of time series that will be churned at each churn event.
 	ChurnRate      float64
 	// ChurnInterval is the duration between churn events.
@@ -112,6 +114,10 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	s.Replica, err = cmd.Flags().GetInt("replica")
+	if err != nil {
+		return err
+	}
 	s.DryRun, err = cmd.Flags().GetBool("dry-run")
 	if err != nil {
 		return err
@@ -148,6 +154,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	log.Printf("Config path: %s", s.ConfigPath)
 	log.Printf("Tags pick rate: %f", s.TagsPickRate)
 	log.Printf("Table pick rate: %d", s.TablePickCount)
+	log.Printf("Replica label value: %d", s.Replica)
 	log.Printf("Dry run: %t", s.DryRun)
 	log.Printf("Churn rate: %f", s.ChurnRate)
 	log.Printf("Churn interval: %s", s.ChurnInterval)
@@ -314,19 +321,26 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 	go func() {
 		defer close(timeSeriesChan)
 
-		labels := make([]samples.LabelCandidates, 0)
-		for _, tag := range fileConfig.Config.Tags {
+		tagOrder := fileConfig.TagOrder
+		if len(tagOrder) != len(fileConfig.Config.Tags) {
+			tagOrder = make([]int, len(fileConfig.Config.Tags))
+			for i := range tagOrder {
+				tagOrder[i] = i
+			}
+			sort.Slice(tagOrder, func(i, j int) bool {
+				return fileConfig.Config.Tags[tagOrder[i]].Name < fileConfig.Config.Tags[tagOrder[j]].Name
+			})
+		}
+
+		labels := make([]samples.LabelCandidates, 0, len(fileConfig.Config.Tags))
+		for _, tagIndex := range tagOrder {
+			tag := fileConfig.Config.Tags[tagIndex]
 			values := tag.Dist.LabelGenerator().All()
 			labels = append(labels, samples.LabelCandidates{
 				Name:   tag.Name,
 				Values: values,
 			})
 		}
-
-		// Sort labels by name lexicographically to ensure consistent ordering
-		sort.Slice(labels, func(i, j int) bool {
-			return labels[i].Name < labels[j].Name
-		})
 
 		// Create a channel for the permutations
 		permChan := make(chan SeriesWithIndex, 1)
@@ -341,6 +355,18 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 
 		// Track series index for churn calculation
 		seriesIdx := 0
+		replicaValue := strconv.Itoa(s.Replica)
+		replicaInsertIndex := fileConfig.ReplicaInsertIndex
+		if len(fileConfig.TagOrder) != len(fileConfig.Config.Tags) || replicaInsertIndex < 0 || replicaInsertIndex > len(tagOrder) {
+			replicaInsertIndex = 0
+			for _, idx := range tagOrder {
+				if fileConfig.Config.Tags[idx].Name < "replica" {
+					replicaInsertIndex++
+				} else {
+					break
+				}
+			}
+		}
 
 		// Process each series one by one
 		for seriesWithIndex := range permChan {
@@ -358,7 +384,15 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 				},
 				Samples: make([]prompb.Sample, 0),
 			}
-			for _, labelPair := range series {
+			replicaInserted := false
+			for labelIndex, labelPair := range series {
+				if labelIndex == replicaInsertIndex {
+					ts.Labels = append(ts.Labels, prompb.Label{
+						Name:  "replica",
+						Value: replicaValue,
+					})
+					replicaInserted = true
+				}
 				if pickRate < 1.0 {
 					if rand.Float32() > pickRate {
 						continue
@@ -371,6 +405,12 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileCo
 				ts.Labels = append(ts.Labels, prompb.Label{
 					Name:  labelPair.Name,
 					Value: labelPair.Value,
+				})
+			}
+			if !replicaInserted && replicaInsertIndex == len(series) {
+				ts.Labels = append(ts.Labels, prompb.Label{
+					Name:  "replica",
+					Value: replicaValue,
 				})
 			}
 
@@ -567,7 +607,6 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().BoolP("infinite", "i", false, "Run indefinitely")
 	rootCmd.Flags().Float32P("tags-pick-rate", "p", 1.0, "The rate of the pick tags")
 	rootCmd.Flags().Uint64P("table-pick-count", "n", math.MaxUint64, "The number of tables to pick from")
-	rootCmd.Flags().StringP("database", "d", "", "The database name to add as a label to all metrics")
 	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")
 	rootCmd.Flags().Float64("churn-rate", 0.0, "The rate of time series to churn (0.0-1.0, e.g., 0.01 = 1%)")
 	rootCmd.Flags().String("churn-interval", "0s", "The interval at which churn occurs (e.g., 10m)")

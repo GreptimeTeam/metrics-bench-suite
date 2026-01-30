@@ -1,19 +1,23 @@
 package samples
 
 import (
+	"fmt"
 	"io/fs"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 )
 
 // FileConfig represents a parsed YAML configuration file
 type FileConfig struct {
-	Name   string
-	Config Config
+	Name               string
+	Config             Config
+	TagOrder           []int
+	ReplicaInsertIndex int
 }
 
 func getFileNameWithoutExt(path string) string {
@@ -45,9 +49,16 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 			log.Printf("Parsing file: %s, num series: %d\n", path, num_series)
 			totalSeries += num_series
 
+			tagOrder, replicaInsertIndex, err := computeTagOrderAndReplicaInsertIndex(data.Tags)
+			if err != nil {
+				return err
+			}
+
 			fileConfigs = append(fileConfigs, FileConfig{
-				Name:   metricName,
-				Config: data,
+				Name:               metricName,
+				Config:             data,
+				TagOrder:           tagOrder,
+				ReplicaInsertIndex: replicaInsertIndex,
 			})
 			if uint64(len(fileConfigs)) > tablePickCount {
 				log.Printf("Warning: More than %d YAML files found. Only the first %d will be used.\n", tablePickCount, tablePickCount)
@@ -64,6 +75,31 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 	}
 
 	return fileConfigs, nil
+}
+
+func computeTagOrderAndReplicaInsertIndex(tags []Tag) ([]int, int, error) {
+	order := make([]int, len(tags))
+	for i, tag := range tags {
+		if tag.Name == "replica" {
+			return nil, 0, fmt.Errorf("tag name \"replica\" is reserved for sample_loader")
+		}
+		order[i] = i
+	}
+
+	sort.Slice(order, func(i, j int) bool {
+		return tags[order[i]].Name < tags[order[j]].Name
+	})
+
+	insertIndex := 0
+	for _, idx := range order {
+		if tags[idx].Name < "replica" {
+			insertIndex++
+		} else {
+			break
+		}
+	}
+
+	return order, insertIndex, nil
 }
 
 // WalkAndParseConfig walks a directory and parses all YAML files, returning a list of FileConfig

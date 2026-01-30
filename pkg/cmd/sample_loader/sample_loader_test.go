@@ -223,7 +223,6 @@ func TestTagSetPermutationStream(t *testing.T) {
 // 1. First label is always '__name__'
 // 2. All labels are sorted according to label name lexicographically
 func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
-	// Create a sample loader instance with Database field
 	s := &SampleLoader{}
 	// Initialize the fieldGeneratorsPerFile map to prevent nil pointer reference
 	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
@@ -289,7 +288,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 		pickRateStr := fmt.Sprintf("%.1f", pickRate)
 		t.Run("PickRate_"+pickRateStr, func(t *testing.T) {
 			currentTime := time.Now()
-			timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, pickRate)
+			timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, pickRate, 0, 0)
 
 			// Collect all time series
 			timeSeries := make([]prompb.TimeSeries, 0)
@@ -319,15 +318,13 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 					t.Errorf("First label value should be 'test_metric', got '%s'", ts.Labels[0].Value)
 				}
 
-				// Check 2: Other labels (excluding __name__ and database if present) are sorted lexicographically
+				// Check 2: Other labels (excluding __name__) are sorted lexicographically
 				labelsAfterName := make([]prompb.Label, 0)
 				for _, label := range ts.Labels[1:] { // Skip the first __name__ label
-					if label.Name != "database" { // Exclude database label for sorting check
-						labelsAfterName = append(labelsAfterName, label)
-					}
+					labelsAfterName = append(labelsAfterName, label)
 				}
 
-				// Verify labels are sorted lexicographically (excluding __name__ and database)
+				// Verify labels are sorted lexicographically (excluding __name__)
 				for i := 0; i < len(labelsAfterName)-1; i++ {
 					if labelsAfterName[i].Name > labelsAfterName[i+1].Name {
 						t.Errorf("Labels are not sorted lexicographically: '%s' > '%s'",
@@ -336,5 +333,108 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNewCommandDoesNotExposeDatabaseFlag(t *testing.T) {
+	cmd := NewCommand()
+	if flag := cmd.Flags().Lookup("database"); flag != nil {
+		t.Fatalf("expected no database flag, got %q", flag.Name)
+	}
+}
+
+func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
+	s := &SampleLoader{}
+	s.fieldGeneratorsPerFile = make(map[string]samples.FloatGenerator)
+
+	sampleLoaderValue := reflect.ValueOf(s).Elem()
+	replicaField := sampleLoaderValue.FieldByName("Replica")
+	if !replicaField.IsValid() {
+		t.Fatalf("SampleLoader missing Replica field")
+	}
+	if replicaField.Kind() != reflect.Int {
+		t.Fatalf("SampleLoader Replica field should be int")
+	}
+	replicaField.SetInt(2)
+
+	labelsValues := []samples.PresetItem{
+		{Value: "a", Weight: 1},
+	}
+	fileConfig := samples.FileConfig{
+		Name: "test_metric",
+		Config: samples.Config{
+			Tags: []samples.Tag{
+				{
+					Name: "sigma",
+					Dist: samples.Distribution{
+						Type:   "weighted_preset",
+						Preset: labelsValues,
+					},
+				},
+				{
+					Name: "alpha",
+					Dist: samples.Distribution{
+						Type:   "weighted_preset",
+						Preset: labelsValues,
+					},
+				},
+			},
+			Fields: []samples.Field{
+				{
+					Name: "value",
+					Dist: samples.Distribution{
+						Type:       "uniform",
+						LowerBound: &[]float64{0.0}[0],
+						UpperBound: &[]float64{100.0}[0],
+					},
+				},
+			},
+		},
+	}
+
+	fileConfigValue := reflect.ValueOf(&fileConfig).Elem()
+	tagOrderField := fileConfigValue.FieldByName("TagOrder")
+	if !tagOrderField.IsValid() {
+		t.Fatalf("FileConfig missing TagOrder field")
+	}
+	if tagOrderField.Kind() != reflect.Slice {
+		t.Fatalf("FileConfig TagOrder field should be a slice")
+	}
+	tagOrderField.Set(reflect.ValueOf([]int{1, 0}))
+
+	replicaInsertField := fileConfigValue.FieldByName("ReplicaInsertIndex")
+	if !replicaInsertField.IsValid() {
+		t.Fatalf("FileConfig missing ReplicaInsertIndex field")
+	}
+	if replicaInsertField.Kind() != reflect.Int {
+		t.Fatalf("FileConfig ReplicaInsertIndex field should be int")
+	}
+	replicaInsertField.SetInt(1)
+
+	currentTime := time.Now()
+	timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, 1.0, 0, 0)
+
+	var timeSeries []prompb.TimeSeries
+	for ts := range timeSeriesChan {
+		timeSeries = append(timeSeries, ts)
+	}
+	if len(timeSeries) == 0 {
+		t.Fatalf("Expected at least one time series")
+	}
+
+	ts := timeSeries[0]
+	if len(ts.Labels) < 4 {
+		t.Fatalf("Expected at least 4 labels, got %d", len(ts.Labels))
+	}
+
+	expectedOrder := []string{"__name__", "alpha", "replica", "sigma"}
+	for i, name := range expectedOrder {
+		if ts.Labels[i].Name != name {
+			t.Fatalf("Expected label %d to be %q, got %q", i, name, ts.Labels[i].Name)
+		}
+	}
+
+	if ts.Labels[2].Value != "2" {
+		t.Fatalf("Expected replica label value to be %q, got %q", "2", ts.Labels[2].Value)
 	}
 }
