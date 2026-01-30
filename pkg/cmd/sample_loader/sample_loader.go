@@ -39,9 +39,9 @@ type SampleLoader struct {
 	DryRun         bool
 	Replica        int
 	// ChurnRate is the fraction (0.0–1.0) of time series that will be churned at each churn event.
-	ChurnRate      float64
+	ChurnRate float64
 	// ChurnInterval is the duration between churn events.
-	ChurnInterval  time.Duration
+	ChurnInterval time.Duration
 	// churnEpoch tracks the current churn generation, incremented each ChurnInterval
 	churnEpoch int64
 	// churnMutex protects access to churnEpoch
@@ -539,26 +539,7 @@ func convertIndexToKey(indices []int) string {
 		key += fmt.Sprintf("%d", idx)
 	}
 	return key
-}
-
-// getFieldGeneratorForFile returns a field generator for a specific series in a file config, creating it if it doesn't exist
-func (s *SampleLoader) getFieldGeneratorForFile(fileName string, indices []int, dist samples.Distribution) samples.FloatGenerator {
-	s.fieldGeneratorsMutex.Lock()
-	defer s.fieldGeneratorsMutex.Unlock()
-
-	// Create a composite key from file name and indices
-	compositeKey := fileName + ":" + convertIndexToKey(indices)
-
-	// Check if generator already exists for this combination
-	if generator, exists := s.fieldGeneratorsPerFile[compositeKey]; exists {
-		return generator
-	}
-
-	// Create new generator and store it
-	generator := dist.FieldGenerator()
-	s.fieldGeneratorsPerFile[compositeKey] = generator
-	return generator
-}
+gst}
 
 // getFieldGeneratorForFileWithChurn returns a field generator for a specific series, incorporating churn info for churned series
 func (s *SampleLoader) getFieldGeneratorForFileWithChurn(fileName string, indices []int, dist samples.Distribution, churnRate float64, churnEpoch int64, seriesIdx int) samples.FloatGenerator {
@@ -604,6 +585,7 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().IntP("max-samples", "s", 20000, "The max number of metrics to load")
 	rootCmd.Flags().StringP("tick-interval", "t", "30s", "The interval of the requests")
 	rootCmd.Flags().IntP("workers", "w", 1, "The number of workers to send requests")
+	rootCmd.Flags().IntP("replica", "r", 0, "The replica tab value of current instance")
 	rootCmd.Flags().BoolP("infinite", "i", false, "Run indefinitely")
 	rootCmd.Flags().Float32P("tags-pick-rate", "p", 1.0, "The rate of the pick tags")
 	rootCmd.Flags().Uint64P("table-pick-count", "n", math.MaxUint64, "The number of tables to pick from")
