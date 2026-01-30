@@ -350,65 +350,82 @@ func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current 
 	}
 
 	TagSetPermutationStream(labels, func(seriesWithIndex SeriesWithIndex) {
-		series := seriesWithIndex.Series
-		index := seriesWithIndex.Index
+		s.processSingleFileConfigSeries(fileConfig, seriesWithIndex, seriesIdx, replicaValue, replicaInsertIndex, field, current, churnRate, churnEpoch, out)
+		seriesIdx++
+	})
+}
 
-		ts := prompb.TimeSeries{
-			Labels: []prompb.Label{
-				{
-					Name:  "__name__",
-					Value: fileConfig.Name,
-				},
+// processSingleFileConfigSeries builds one TimeSeries for a single label-series from a file config
+// and sends it on out. seriesIdx is the 0-based index of this series in the permutation stream.
+func (s *SampleLoader) processSingleFileConfigSeries(
+	fileConfig samples.FileConfig,
+	seriesWithIndex SeriesWithIndex,
+	seriesIdx int,
+	replicaValue string,
+	replicaInsertIndex int,
+	field samples.Field,
+	current time.Time,
+	churnRate float64,
+	churnEpoch int64,
+	out chan<- prompb.TimeSeries,
+) {
+	series := seriesWithIndex.Series
+	index := seriesWithIndex.Index
+
+	ts := prompb.TimeSeries{
+		Labels: []prompb.Label{
+			{
+				Name:  "__name__",
+				Value: fileConfig.Name,
 			},
-			Samples: make([]prompb.Sample, 0),
-		}
-		replicaInserted := false
-		for labelIndex, labelPair := range series {
-			if labelIndex == replicaInsertIndex {
-				ts.Labels = append(ts.Labels, prompb.Label{
-					Name:  "replica",
-					Value: replicaValue,
-				})
-				replicaInserted = true
-			}
-			if labelPair.Value == "" {
-				continue
-			}
-			ts.Labels = append(ts.Labels, prompb.Label{
-				Name:  labelPair.Name,
-				Value: labelPair.Value,
-			})
-		}
-		if !replicaInserted && replicaInsertIndex == len(series) {
+		},
+		Samples: make([]prompb.Sample, 0),
+	}
+	replicaInserted := false
+	for labelIndex, labelPair := range series {
+		if labelIndex == replicaInsertIndex {
 			ts.Labels = append(ts.Labels, prompb.Label{
 				Name:  "replica",
 				Value: replicaValue,
 			})
+			replicaInserted = true
 		}
-
-		if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
-			churnLabel := prompb.Label{
-				Name:  "churn_id",
-				Value: fmt.Sprintf("epoch_%d", churnEpoch),
-			}
-			insertIdx := 1
-			for insertIdx < len(ts.Labels) && ts.Labels[insertIdx].Name < churnLabel.Name {
-				insertIdx++
-			}
-			ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
+		if labelPair.Value == "" {
+			continue
 		}
-
-		generator := s.getFieldGeneratorForFileWithChurn(fileConfig.Name, index, field.Dist, churnRate, churnEpoch, seriesIdx)
-		value := generator.Next()
-
-		ts.Samples = append(ts.Samples, prompb.Sample{
-			Value:     value,
-			Timestamp: current.UnixMilli(),
+		ts.Labels = append(ts.Labels, prompb.Label{
+			Name:  labelPair.Name,
+			Value: labelPair.Value,
 		})
+	}
+	if !replicaInserted && replicaInsertIndex == len(series) {
+		ts.Labels = append(ts.Labels, prompb.Label{
+			Name:  "replica",
+			Value: replicaValue,
+		})
+	}
 
-		out <- ts
-		seriesIdx++
+	if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
+		churnLabel := prompb.Label{
+			Name:  "churn_id",
+			Value: fmt.Sprintf("epoch_%d", churnEpoch),
+		}
+		insertIdx := 1
+		for insertIdx < len(ts.Labels) && ts.Labels[insertIdx].Name < churnLabel.Name {
+			insertIdx++
+		}
+		ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
+	}
+
+	generator := s.getFieldGeneratorForFileWithChurn(fileConfig.Name, index, field.Dist, churnRate, churnEpoch, seriesIdx)
+	value := generator.Next()
+
+	ts.Samples = append(ts.Samples, prompb.Sample{
+		Value:     value,
+		Timestamp: current.UnixMilli(),
 	})
+
+	out <- ts
 }
 
 // shouldChurn determines if a series at the given index should be churned based on the churn rate

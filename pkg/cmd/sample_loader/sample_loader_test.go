@@ -230,7 +230,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 		pickRateStr := fmt.Sprintf("%.1f", pickRate)
 		t.Run("PickRate_"+pickRateStr, func(t *testing.T) {
 			currentTime := time.Now()
-			timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, pickRate, 0, 0)
+			timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, 0, 0)
 
 			// Collect all time series
 			timeSeries := make([]prompb.TimeSeries, 0)
@@ -354,7 +354,7 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 	replicaInsertField.SetInt(1)
 
 	currentTime := time.Now()
-	timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, 1.0, 0, 0)
+	timeSeriesChan := s.generateTimeSeriesForFileConfig(fileConfig, currentTime, 0, 0)
 
 	var timeSeries []prompb.TimeSeries
 	for ts := range timeSeriesChan {
