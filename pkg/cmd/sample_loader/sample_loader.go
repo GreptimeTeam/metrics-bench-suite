@@ -262,15 +262,13 @@ type SeriesWithIndex struct {
 	Index  []int
 }
 
-// TagSetPermutationStream generates permutations on-demand using a goroutine
-func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- SeriesWithIndex, totalCount *int) {
-	defer close(permChan)
+// TagSetPermutationStream calls fn for each label permutation (combination of label values).
+func TagSetPermutationStream(labels []samples.LabelCandidates, fn func(SeriesWithIndex)) {
 	if len(labels) == 0 {
-		permChan <- SeriesWithIndex{
+		fn(SeriesWithIndex{
 			Series: make([]LabelPair, 0),
 			Index:  make([]int, 0),
-		}
-		*totalCount++
+		})
 		return
 	}
 
@@ -280,9 +278,7 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 		end[i] = len(label.Values)
 	}
 
-	// Generate all combinations
 	for {
-		// Create the current combination
 		series := make([]LabelPair, 0, len(labels))
 		for i, label := range labels {
 			series = append(series, LabelPair{
@@ -290,13 +286,11 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 				Value: label.Values[current[i]],
 			})
 		}
-		permChan <- SeriesWithIndex{
+		fn(SeriesWithIndex{
 			Series: series,
-			Index:  append([]int(nil), current...), // copy the current index
-		}
-		*totalCount++
+			Index:  append([]int(nil), current...),
+		})
 
-		// Increment the combination like counting in base-n
 		i := 0
 		for i < len(current) {
 			current[i]++
@@ -306,8 +300,6 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 			current[i] = 0
 			i++
 		}
-
-		// Check if we've exhausted all combinations
 		if i >= len(current) {
 			break
 		}
@@ -317,137 +309,117 @@ func TagSetPermutationStream(labels []samples.LabelCandidates, permChan chan<- S
 // generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
 func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig samples.FileConfig, current time.Time, pickRate float32, churnRate float64, churnEpoch int64) <-chan prompb.TimeSeries {
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
-
 	go func() {
 		defer close(timeSeriesChan)
+		s.processFileConfig(fileConfig, current, pickRate, churnRate, churnEpoch, timeSeriesChan)
+	}()
+	return timeSeriesChan
+}
 
-		tagOrder := fileConfig.TagOrder
-		if len(tagOrder) != len(fileConfig.Config.Tags) {
-			tagOrder = make([]int, len(fileConfig.Config.Tags))
-			for i := range tagOrder {
-				tagOrder[i] = i
-			}
-			sort.Slice(tagOrder, func(i, j int) bool {
-				return fileConfig.Config.Tags[tagOrder[i]].Name < fileConfig.Config.Tags[tagOrder[j]].Name
-			})
+// processFileConfig processes a single file config and sends generated time series to out.
+func (s *SampleLoader) processFileConfig(fileConfig samples.FileConfig, current time.Time, pickRate float32, churnRate float64, churnEpoch int64, out chan<- prompb.TimeSeries) {
+	tagOrder := fileConfig.TagOrder
+	if len(tagOrder) != len(fileConfig.Config.Tags) {
+		tagOrder = make([]int, len(fileConfig.Config.Tags))
+		for i := range tagOrder {
+			tagOrder[i] = i
 		}
+		sort.Slice(tagOrder, func(i, j int) bool {
+			return fileConfig.Config.Tags[tagOrder[i]].Name < fileConfig.Config.Tags[tagOrder[j]].Name
+		})
+	}
 
-		labels := make([]samples.LabelCandidates, 0, len(fileConfig.Config.Tags))
-		for _, tagIndex := range tagOrder {
-			tag := fileConfig.Config.Tags[tagIndex]
-			values := tag.Dist.LabelGenerator().All()
-			labels = append(labels, samples.LabelCandidates{
-				Name:   tag.Name,
-				Values: values,
-			})
-		}
+	labels := make([]samples.LabelCandidates, 0, len(fileConfig.Config.Tags))
+	for _, tagIndex := range tagOrder {
+		tag := fileConfig.Config.Tags[tagIndex]
+		values := tag.Dist.LabelGenerator().All()
+		labels = append(labels, samples.LabelCandidates{
+			Name:   tag.Name,
+			Values: values,
+		})
+	}
 
-		// Create a channel for the permutations
-		permChan := make(chan SeriesWithIndex, 1)
+	field := fileConfig.Config.Fields[0]
 
-		// Start a goroutine to generate permutations
-		go func() {
-			var totalCount int
-			TagSetPermutationStream(labels, permChan, &totalCount)
-		}()
-
-		field := fileConfig.Config.Fields[0]
-
-		// Track series index for churn calculation
-		seriesIdx := 0
-		replicaValue := strconv.Itoa(s.Replica)
-		replicaInsertIndex := fileConfig.ReplicaInsertIndex
-		if len(fileConfig.TagOrder) != len(fileConfig.Config.Tags) || replicaInsertIndex < 0 || replicaInsertIndex > len(tagOrder) {
-			replicaInsertIndex = 0
-			for _, idx := range tagOrder {
-				if fileConfig.Config.Tags[idx].Name < "replica" {
-					replicaInsertIndex++
-				} else {
-					break
-				}
+	seriesIdx := 0
+	replicaValue := strconv.Itoa(s.Replica)
+	replicaInsertIndex := fileConfig.ReplicaInsertIndex
+	if len(fileConfig.TagOrder) != len(fileConfig.Config.Tags) || replicaInsertIndex < 0 || replicaInsertIndex > len(tagOrder) {
+		replicaInsertIndex = 0
+		for _, idx := range tagOrder {
+			if fileConfig.Config.Tags[idx].Name < "replica" {
+				replicaInsertIndex++
+			} else {
+				break
 			}
 		}
+	}
 
-		// Process each series one by one
-		for seriesWithIndex := range permChan {
-			series := seriesWithIndex.Series
-			index := seriesWithIndex.Index
+	TagSetPermutationStream(labels, func(seriesWithIndex SeriesWithIndex) {
+		series := seriesWithIndex.Series
+		index := seriesWithIndex.Index
 
-			// Create a single time series for this specific tag combination
-			// Start with the __name__ label as the first label
-			ts := prompb.TimeSeries{
-				Labels: []prompb.Label{
-					{
-						Name:  "__name__",
-						Value: fileConfig.Name,
-					},
+		ts := prompb.TimeSeries{
+			Labels: []prompb.Label{
+				{
+					Name:  "__name__",
+					Value: fileConfig.Name,
 				},
-				Samples: make([]prompb.Sample, 0),
-			}
-			replicaInserted := false
-			for labelIndex, labelPair := range series {
-				if labelIndex == replicaInsertIndex {
-					ts.Labels = append(ts.Labels, prompb.Label{
-						Name:  "replica",
-						Value: replicaValue,
-					})
-					replicaInserted = true
-				}
-				if pickRate < 1.0 {
-					if rand.Float32() > pickRate {
-						continue
-					}
-				}
-				// Filter out labels with empty values (not allowed in Prometheus Remote Write protocol)
-				if labelPair.Value == "" {
-					continue
-				}
-				ts.Labels = append(ts.Labels, prompb.Label{
-					Name:  labelPair.Name,
-					Value: labelPair.Value,
-				})
-			}
-			if !replicaInserted && replicaInsertIndex == len(series) {
+			},
+			Samples: make([]prompb.Sample, 0),
+		}
+		replicaInserted := false
+		for labelIndex, labelPair := range series {
+			if labelIndex == replicaInsertIndex {
 				ts.Labels = append(ts.Labels, prompb.Label{
 					Name:  "replica",
 					Value: replicaValue,
 				})
+				replicaInserted = true
 			}
-
-			// Apply churn: for series that fall within the churn rate percentage,
-			// add a churn_id label that changes with each epoch, creating new unique series
-			if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
-				churnLabel := prompb.Label{
-					Name:  "churn_id",
-					Value: fmt.Sprintf("epoch_%d", churnEpoch),
+			if pickRate < 1.0 {
+				if rand.Float32() > pickRate {
+					continue
 				}
-				// Insert churn_id in sorted position (labels are already sorted, __name__ is first)
-				// Find the correct position to insert (after __name__, in alphabetical order)
-				insertIdx := 1 // Start after __name__
-				for insertIdx < len(ts.Labels) && ts.Labels[insertIdx].Name < churnLabel.Name {
-					insertIdx++
-				}
-				// Insert at the correct position
-				ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
 			}
-
-			// Get or create a field generator for this specific series using the index
-			// Include churn info in the key for churned series to get fresh generators
-			generator := s.getFieldGeneratorForFileWithChurn(fileConfig.Name, index, field.Dist, churnRate, churnEpoch, seriesIdx)
-			value := generator.Next()
-
-			ts.Samples = append(ts.Samples, prompb.Sample{
-				Value:     value,
-				Timestamp: current.UnixMilli(),
+			if labelPair.Value == "" {
+				continue
+			}
+			ts.Labels = append(ts.Labels, prompb.Label{
+				Name:  labelPair.Name,
+				Value: labelPair.Value,
 			})
-
-			// Send this single time series to the channel
-			timeSeriesChan <- ts
-			seriesIdx++
 		}
-	}()
+		if !replicaInserted && replicaInsertIndex == len(series) {
+			ts.Labels = append(ts.Labels, prompb.Label{
+				Name:  "replica",
+				Value: replicaValue,
+			})
+		}
 
-	return timeSeriesChan
+		if churnRate > 0 && s.shouldChurn(seriesIdx, churnRate) {
+			churnLabel := prompb.Label{
+				Name:  "churn_id",
+				Value: fmt.Sprintf("epoch_%d", churnEpoch),
+			}
+			insertIdx := 1
+			for insertIdx < len(ts.Labels) && ts.Labels[insertIdx].Name < churnLabel.Name {
+				insertIdx++
+			}
+			ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
+		}
+
+		generator := s.getFieldGeneratorForFileWithChurn(fileConfig.Name, index, field.Dist, churnRate, churnEpoch, seriesIdx)
+		value := generator.Next()
+
+		ts.Samples = append(ts.Samples, prompb.Sample{
+			Value:     value,
+			Timestamp: current.UnixMilli(),
+		})
+
+		out <- ts
+		seriesIdx++
+	})
 }
 
 // shouldChurn determines if a series at the given index should be churned based on the churn rate
@@ -539,7 +511,7 @@ func convertIndexToKey(indices []int) string {
 		key += fmt.Sprintf("%d", idx)
 	}
 	return key
-gst}
+}
 
 // getFieldGeneratorForFileWithChurn returns a field generator for a specific series, incorporating churn info for churned series
 func (s *SampleLoader) getFieldGeneratorForFileWithChurn(fileName string, indices []int, dist samples.Distribution, churnRate float64, churnEpoch int64, seriesIdx int) samples.FloatGenerator {

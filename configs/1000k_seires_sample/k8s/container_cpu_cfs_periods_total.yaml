@@ -1,6 +1,6 @@
 start: "2021-01-01T00:00:00Z"
 end: "2021-01-01T00:00:00Z"
-interval: 30
+
 tags:
     - name: cluster
       type: String

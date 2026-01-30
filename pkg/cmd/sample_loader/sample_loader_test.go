@@ -15,23 +15,12 @@ func TestTagSetPermutationStream(t *testing.T) {
 	// Test case 1: Empty labels
 	t.Run("Empty labels", func(t *testing.T) {
 		var labels []samples.LabelCandidates
-		permChan := make(chan SeriesWithIndex, 10)
-		totalCount := 0
-
-		go TagSetPermutationStream(labels, permChan, &totalCount)
-
 		var results []SeriesWithIndex
-		for perm := range permChan {
-			results = append(results, perm)
-		}
+		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 1
-		if totalCount != expectedCount {
-			t.Errorf("Expected total count %d, got %d", expectedCount, totalCount)
-		}
-
-		if len(results) != 1 {
-			t.Errorf("Expected 1 result, got %d", len(results))
+		if len(results) != expectedCount {
+			t.Errorf("Expected total count %d, got %d", expectedCount, len(results))
 		}
 
 		if len(results[0].Series) != 0 {
@@ -47,23 +36,12 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"value1"},
 			},
 		}
-		permChan := make(chan SeriesWithIndex, 10)
-		totalCount := 0
-
-		go TagSetPermutationStream(labels, permChan, &totalCount)
-
-		results := make([]SeriesWithIndex, 0)
-		for perm := range permChan {
-			results = append(results, perm)
-		}
+		var results []SeriesWithIndex
+		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 1
-		if totalCount != expectedCount {
-			t.Errorf("Expected total count %d, got %d", expectedCount, totalCount)
-		}
-
-		if len(results) != 1 {
-			t.Errorf("Expected 1 result, got %d", len(results))
+		if len(results) != expectedCount {
+			t.Errorf("Expected total count %d, got %d", expectedCount, len(results))
 		}
 
 		expectedSeries := []LabelPair{
@@ -82,27 +60,15 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"value1", "value2", "value3"},
 			},
 		}
-		permChan := make(chan SeriesWithIndex, 10)
-		totalCount := 0
-
-		go TagSetPermutationStream(labels, permChan, &totalCount)
-
-		results := make([]SeriesWithIndex, 0)
-		for perm := range permChan {
-			results = append(results, perm)
-		}
+		var results []SeriesWithIndex
+		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 3
-		if totalCount != expectedCount {
-			t.Errorf("Expected total count %d, got %d", expectedCount, totalCount)
+		if len(results) != expectedCount {
+			t.Errorf("Expected total count %d, got %d", expectedCount, len(results))
 		}
 
-		if len(results) != 3 {
-			t.Errorf("Expected 3 results, got %d", len(results))
-		}
-
-		// Extract values for comparison
-		foundValues := make([]string, 0)
+		foundValues := make([]string, 0, len(results))
 		for _, result := range results {
 			foundValues = append(foundValues, result.Series[0].Value)
 		}
@@ -126,29 +92,17 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"x", "y"},
 			},
 		}
-		permChan := make(chan SeriesWithIndex, 10)
-		totalCount := 0
-
-		go TagSetPermutationStream(labels, permChan, &totalCount)
-
-		results := make([]SeriesWithIndex, 0)
-		for perm := range permChan {
-			results = append(results, perm)
-		}
+		var results []SeriesWithIndex
+		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 4 // 2 * 2 = 4 combinations
-		if totalCount != expectedCount {
-			t.Errorf("Expected total count %d, got %d", expectedCount, totalCount)
+		if len(results) != expectedCount {
+			t.Errorf("Expected total count %d, got %d", expectedCount, len(results))
 		}
 
-		if len(results) != 4 {
-			t.Errorf("Expected 4 results, got %d", len(results))
-		}
-
-		// Verify all combinations exist
 		var combinations []string
 		for _, result := range results {
-			combination := result.Series[0].Value + "," + result.Series[1].Value // label1 + "," + label2
+			combination := result.Series[0].Value + "," + result.Series[1].Value
 			combinations = append(combinations, combination)
 		}
 
@@ -179,26 +133,14 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"web"},
 			},
 		}
-		permChan := make(chan SeriesWithIndex, 100) // Larger buffer to handle all combinations
-		totalCount := 0
-
-		go TagSetPermutationStream(labels, permChan, &totalCount)
-
-		results := make([]SeriesWithIndex, 0)
-		for perm := range permChan {
-			results = append(results, perm)
-		}
+		var results []SeriesWithIndex
+		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 6 // 2 * 3 * 1 = 6 combinations
-		if totalCount != expectedCount {
-			t.Errorf("Expected total count %d, got %d", expectedCount, totalCount)
+		if len(results) != expectedCount {
+			t.Errorf("Expected total count %d, got %d", expectedCount, len(results))
 		}
 
-		if len(results) != 6 {
-			t.Errorf("Expected 6 results, got %d", len(results))
-		}
-
-		// Verify all combinations exist
 		var combinations []string
 		for _, result := range results {
 			combination := result.Series[0].Value + "," + result.Series[1].Value + "," + result.Series[2].Value
