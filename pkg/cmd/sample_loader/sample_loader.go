@@ -144,6 +144,8 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("no config files found")
 	}
 
+	samples.AssignChurnIndices(fileConfigs, s.ChurnRate)
+
 	log.Printf("Generating metrics...")
 
 	requestChan := make(chan prompb.WriteRequest, s.Workers)
@@ -235,7 +237,7 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig *samples.FileC
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
 	go func() {
 		defer close(timeSeriesChan)
-		fileConfig.GeneratePermutedTimeSeries(currentTime, churnEpoch, s.Replica, s.ChurnRate, timeSeriesChan)
+		fileConfig.GeneratePermutedTimeSeries(currentTime, churnEpoch, s.Replica, timeSeriesChan)
 	}()
 	return timeSeriesChan
 }

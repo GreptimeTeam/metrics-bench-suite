@@ -18,6 +18,8 @@ type FileConfig struct {
 	Config             Config
 	TagOrder           []int
 	ReplicaInsertIndex int
+	SeriesCount        int
+	ChurnIndices       []int
 	// FieldGenerators caches field value generators per series key (and churn epoch when applicable).
 	// Populated at runtime; not serialized from YAML.
 	FieldGenerators map[string]FloatGenerator
@@ -70,12 +72,9 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 			}
 
 			metricName := getFileNameWithoutExt(path)
-			num_series := 1
-			for _, tag := range data.Tags {
-				num_series *= tag.Dist.LabelGenerator().NumCandidates()
-			}
-			log.Printf("Parsing file: %s, num series: %d\n", path, num_series)
-			totalSeries += num_series
+			numSeries := computeSeriesCount(data.Tags)
+			log.Printf("Parsing file: %s, num series: %d\n", path, numSeries)
+			totalSeries += numSeries
 
 			tagOrder, replicaInsertIndex, err := computeTagOrderAndReplicaInsertIndex(data.Tags)
 			if err != nil {
@@ -87,6 +86,7 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 				Config:             data,
 				TagOrder:           tagOrder,
 				ReplicaInsertIndex: replicaInsertIndex,
+				SeriesCount:        numSeries,
 			})
 			if uint64(len(fileConfigs)) > tablePickCount {
 				log.Printf("Warning: More than %d YAML files found. Only the first %d will be used.\n", tablePickCount, tablePickCount)
@@ -103,6 +103,89 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 	}
 
 	return fileConfigs, nil
+}
+
+func computeSeriesCount(tags []Tag) int {
+	seriesCount := 1
+	for _, tag := range tags {
+		seriesCount *= tag.Dist.LabelGenerator().NumCandidates()
+	}
+	return seriesCount
+}
+
+// AssignChurnIndices precomputes which series indices should churn for each file config.
+// Indices are deterministic: they are assigned based on per-file series counts, sorted by
+// file name for remainder distribution, and each file gets the lowest indices [0..N-1].
+func AssignChurnIndices(fileConfigs []FileConfig, churnRate float64) {
+	if churnRate <= 0 || len(fileConfigs) == 0 {
+		for i := range fileConfigs {
+			fileConfigs[i].ChurnIndices = nil
+		}
+		return
+	}
+
+	totalSeries := 0
+	for i := range fileConfigs {
+		if fileConfigs[i].SeriesCount == 0 {
+			fileConfigs[i].SeriesCount = computeSeriesCount(fileConfigs[i].Config.Tags)
+		}
+		totalSeries += fileConfigs[i].SeriesCount
+	}
+	if totalSeries == 0 {
+		return
+	}
+
+	target := int(math.Round(churnRate * float64(totalSeries)))
+	if target < 0 {
+		target = 0
+	}
+	if target > totalSeries {
+		target = totalSeries
+	}
+
+	type fileRef struct {
+		index int
+		name  string
+	}
+	ordered := make([]fileRef, 0, len(fileConfigs))
+	for i := range fileConfigs {
+		ordered = append(ordered, fileRef{index: i, name: fileConfigs[i].Name})
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].name < ordered[j].name
+	})
+
+	remaining := target
+	for _, ref := range ordered {
+		if remaining == 0 {
+			break
+		}
+		share := int(math.Floor(float64(fileConfigs[ref.index].SeriesCount) / float64(totalSeries) * float64(target)))
+		if share > remaining {
+			share = remaining
+		}
+		fileConfigs[ref.index].ChurnIndices = buildChurnIndices(share)
+		remaining -= share
+	}
+
+	for _, ref := range ordered {
+		if remaining == 0 {
+			break
+		}
+		fileConfigs[ref.index].ChurnIndices = append(fileConfigs[ref.index].ChurnIndices, len(fileConfigs[ref.index].ChurnIndices))
+		remaining--
+	}
+}
+
+func buildChurnIndices(count int) []int {
+	if count <= 0 {
+		return nil
+	}
+	indices := make([]int, count)
+	for i := 0; i < count; i++ {
+		indices[i] = i
+	}
+	return indices
 }
 
 func computeTagOrderAndReplicaInsertIndex(tags []Tag) ([]int, int, error) {

@@ -10,7 +10,7 @@ import (
 )
 
 // GeneratePermutedTimeSeries generates time series for every label permutation in the file config.
-func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch int64, replica int, churnRate float64, out chan<- prompb.TimeSeries) {
+func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch int64, replica int, out chan<- prompb.TimeSeries) {
 	tagOrder := f.TagOrder
 	if len(tagOrder) != len(f.Config.Tags) {
 		tagOrder = make([]int, len(f.Config.Tags))
@@ -46,7 +46,7 @@ func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch in
 	}
 
 	TagSetPermutationStream(labels, func(seriesWithIndex SeriesWithIndex) {
-		ts := f.processSingleFileConfigSeries(seriesWithIndex, seriesIdx, replicaInsertIndex, current, churnEpoch, replica, churnRate)
+		ts := f.processSingleFileConfigSeries(seriesWithIndex, seriesIdx, replicaInsertIndex, current, churnEpoch, replica)
 		out <- ts
 		seriesIdx++
 	})
@@ -61,7 +61,6 @@ func (f *FileConfig) processSingleFileConfigSeries(
 	current time.Time,
 	churnEpoch int64,
 	replica int,
-	churnRate float64,
 ) prompb.TimeSeries {
 	series := seriesWithIndex.Series
 	index := seriesWithIndex.Index
@@ -100,7 +99,7 @@ func (f *FileConfig) processSingleFileConfigSeries(
 		})
 	}
 
-	if churnRate > 0 && shouldChurn(seriesIdx, churnRate) {
+	if f.shouldChurn(seriesIdx) {
 		churnLabel := prompb.Label{
 			Name:  "churn_id",
 			Value: fmt.Sprintf("epoch_%d", churnEpoch),
@@ -122,11 +121,10 @@ func (f *FileConfig) processSingleFileConfigSeries(
 	return ts
 }
 
-// shouldChurn determines if a series at the given index should be churned based on the churn rate.
-func shouldChurn(seriesIdx int, churnRate float64) bool {
-	// Use deterministic selection: series indices that fall within the churn percentage are churned.
-	// This ensures consistent selection across generations.
-	// We use modulo 10000 for finer granularity (supports churn rates down to 0.01%).
-	threshold := int(churnRate * 10000)
-	return (seriesIdx % 10000) < threshold
+func (f *FileConfig) shouldChurn(seriesIdx int) bool {
+	if len(f.ChurnIndices) == 0 {
+		return false
+	}
+	i := sort.SearchInts(f.ChurnIndices, seriesIdx)
+	return i < len(f.ChurnIndices) && f.ChurnIndices[i] == seriesIdx
 }

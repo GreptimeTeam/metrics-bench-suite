@@ -10,7 +10,7 @@ import (
 
 func TestProcessPermutedTimeSeriesChurnRateZero(t *testing.T) {
 	fileConfig := buildChurnTestFileConfig()
-	timeSeries := collectPermutedTimeSeries(&fileConfig, 5, 0, 0.0)
+	timeSeries := collectPermutedTimeSeries(&fileConfig, 5, 0)
 
 	if len(timeSeries) != 4 {
 		t.Fatalf("expected 4 time series, got %d", len(timeSeries))
@@ -25,8 +25,9 @@ func TestProcessPermutedTimeSeriesChurnRateZero(t *testing.T) {
 
 func TestProcessPermutedTimeSeriesChurnDeterministic(t *testing.T) {
 	fileConfig := buildChurnTestFileConfig()
+	fileConfig.ChurnIndices = []int{0}
 	churnEpoch := int64(7)
-	timeSeries := collectPermutedTimeSeries(&fileConfig, churnEpoch, 0, 0.0001)
+	timeSeries := collectPermutedTimeSeries(&fileConfig, churnEpoch, 0)
 
 	if len(timeSeries) != 4 {
 		t.Fatalf("expected 4 time series, got %d", len(timeSeries))
@@ -49,9 +50,10 @@ func TestProcessPermutedTimeSeriesChurnDeterministic(t *testing.T) {
 
 func TestGeneratePermutedTimeSeries_ChurnsDeterministicSubset(t *testing.T) {
 	fileConfig := buildChurnTestFileConfig()
+	fileConfig.ChurnIndices = []int{0, 1}
 	churnEpoch := int64(9)
-	// Permuted time series has 4 series; with this churn rate, 2 should churn.
-	timeSeries := collectPermutedTimeSeries(&fileConfig, churnEpoch, 0, 0.0002)
+	// Permuted time series has 4 series; 2 should churn based on indices.
+	timeSeries := collectPermutedTimeSeries(&fileConfig, churnEpoch, 0)
 
 	if len(timeSeries) != 4 {
 		t.Fatalf("expected 4 time series, got %d", len(timeSeries))
@@ -87,6 +89,7 @@ func TestGeneratePermutedTimeSeries_ChurnsDeterministicSubset(t *testing.T) {
 
 func TestProcessSingleFileConfigSeries_ChurnInsertsSortedLabel(t *testing.T) {
 	fileConfig := buildProcessSingleFileConfig()
+	fileConfig.ChurnIndices = []int{0}
 	series := SeriesWithIndex{
 		Series: []LabelPair{
 			{Name: "alpha", Value: "a"},
@@ -102,7 +105,6 @@ func TestProcessSingleFileConfigSeries_ChurnInsertsSortedLabel(t *testing.T) {
 		time.Unix(0, 0),
 		42,
 		3,
-		0.0001,
 	)
 
 	value, ok := getLabelValue(ts.Labels, "churn_id")
@@ -121,6 +123,7 @@ func TestProcessSingleFileConfigSeries_ChurnInsertsSortedLabel(t *testing.T) {
 
 func TestProcessSingleFileConfigSeries_NoChurnWhenNotSelected(t *testing.T) {
 	fileConfig := buildProcessSingleFileConfig()
+	fileConfig.ChurnIndices = []int{0}
 	series := SeriesWithIndex{
 		Series: []LabelPair{
 			{Name: "alpha", Value: "a"},
@@ -136,7 +139,6 @@ func TestProcessSingleFileConfigSeries_NoChurnWhenNotSelected(t *testing.T) {
 		time.Unix(0, 0),
 		42,
 		3,
-		0.0001,
 	)
 
 	if hasLabel(ts.Labels, "churn_id") {
@@ -161,7 +163,6 @@ func TestProcessSingleFileConfigSeries_NoChurnWhenRateZero(t *testing.T) {
 		time.Unix(0, 0),
 		42,
 		3,
-		0.0,
 	)
 
 	if hasLabel(ts.Labels, "churn_id") {
@@ -226,9 +227,9 @@ func buildProcessSingleFileConfig() FileConfig {
 	}
 }
 
-func collectPermutedTimeSeries(fileConfig *FileConfig, churnEpoch int64, replica int, churnRate float64) []prompb.TimeSeries {
+func collectPermutedTimeSeries(fileConfig *FileConfig, churnEpoch int64, replica int) []prompb.TimeSeries {
 	out := make(chan prompb.TimeSeries, 4)
-	fileConfig.GeneratePermutedTimeSeries(time.Now(), churnEpoch, replica, churnRate, out)
+	fileConfig.GeneratePermutedTimeSeries(time.Now(), churnEpoch, replica, out)
 	close(out)
 
 	var results []prompb.TimeSeries
@@ -236,6 +237,79 @@ func collectPermutedTimeSeries(fileConfig *FileConfig, churnEpoch int64, replica
 		results = append(results, ts)
 	}
 	return results
+}
+
+func TestAssignChurnIndices_TotalMatchesTarget(t *testing.T) {
+	fileConfigs := []FileConfig{
+		buildChurnTestFileConfig(),
+		buildChurnTestFileConfig(),
+	}
+	fileConfigs[1].Config.Tags = append(fileConfigs[1].Config.Tags, Tag{
+		Name: "extra",
+		Dist: Distribution{
+			Type: "weighted_preset",
+			Preset: []PresetItem{
+				{Value: "e1", Weight: 1},
+				{Value: "e2", Weight: 1},
+			},
+		},
+	})
+
+	AssignChurnIndices(fileConfigs, 0.25)
+
+	churnTotal := 0
+	for _, fc := range fileConfigs {
+		churnTotal += len(fc.ChurnIndices)
+	}
+	if churnTotal != 3 {
+		t.Fatalf("expected total churn 3, got %d", churnTotal)
+	}
+}
+
+func TestAssignChurnIndices_AssignsDeterministicIndices(t *testing.T) {
+	fileConfigs := []FileConfig{
+		{Name: "b", SeriesCount: 3},
+		{Name: "a", SeriesCount: 5},
+	}
+
+	AssignChurnIndices(fileConfigs, 0.5)
+
+	if len(fileConfigs[0].ChurnIndices) != 1 {
+		t.Fatalf("expected 1 churn index for b, got %d", len(fileConfigs[0].ChurnIndices))
+	}
+	if len(fileConfigs[1].ChurnIndices) != 3 {
+		t.Fatalf("expected 3 churn indices for a, got %d", len(fileConfigs[1].ChurnIndices))
+	}
+
+	expectedB := []int{0}
+	if !reflect.DeepEqual(fileConfigs[0].ChurnIndices, expectedB) {
+		t.Fatalf("expected churn indices %v for b, got %v", expectedB, fileConfigs[0].ChurnIndices)
+	}
+	expectedA := []int{0, 1, 2}
+	if !reflect.DeepEqual(fileConfigs[1].ChurnIndices, expectedA) {
+		t.Fatalf("expected churn indices %v for a, got %v", expectedA, fileConfigs[1].ChurnIndices)
+	}
+}
+
+func TestAssignChurnIndices_IsDeterministicAcrossRuns(t *testing.T) {
+	fileConfigsA := []FileConfig{
+		{Name: "b", SeriesCount: 3},
+		{Name: "a", SeriesCount: 5},
+	}
+	fileConfigsB := []FileConfig{
+		{Name: "b", SeriesCount: 3},
+		{Name: "a", SeriesCount: 5},
+	}
+
+	AssignChurnIndices(fileConfigsA, 0.5)
+	AssignChurnIndices(fileConfigsB, 0.5)
+
+	if !reflect.DeepEqual(fileConfigsA[0].ChurnIndices, fileConfigsB[0].ChurnIndices) {
+		t.Fatalf("expected deterministic churn indices for b across runs")
+	}
+	if !reflect.DeepEqual(fileConfigsA[1].ChurnIndices, fileConfigsB[1].ChurnIndices) {
+		t.Fatalf("expected deterministic churn indices for a across runs")
+	}
 }
 
 func hasLabel(labels []prompb.Label, name string) bool {
