@@ -268,7 +268,7 @@ func (s *SampleLoader) updateChurnEpoch(startTime time.Time) int64 {
 	}
 }
 
-func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, current time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) {
+func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -279,7 +279,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 		go func(fc *samples.FileConfig) {
 			defer wg.Done()
 			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(fc, current, churnEpoch)
+			tsChan := s.generateTimeSeriesForFileConfig(fc, currentTime, churnEpoch)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
 				timeSeriesChan <- ts
