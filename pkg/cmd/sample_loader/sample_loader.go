@@ -33,10 +33,6 @@ type SampleLoader struct {
 	ChurnRate float64
 	// ChurnInterval is the duration between churn events.
 	ChurnInterval time.Duration
-	// churnEpoch tracks the current churn generation, incremented each ChurnInterval
-	churnEpoch int64
-	// churnMutex protects access to churnEpoch
-	churnMutex sync.RWMutex
 }
 
 func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
@@ -174,15 +170,12 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	}
 
 	// Track start time for churn epoch calculation
-	startTime := time.Now()
-	s.churnEpoch = 0
+	churnEpochGenerator := samples.NewChurnEpochGenerator(s.ChurnInterval)
+	currentEpoch := churnEpochGenerator.GetChurnEpoch()
 
 	// First generation immediately after jitter
-	s.churnMutex.RLock()
-	currentChurnEpoch := s.churnEpoch
-	s.churnMutex.RUnlock()
-	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
-	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentChurnEpoch)
+	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
+	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentEpoch)
 	current = current.Add(s.Interval)
 	if !s.Infinite {
 		if current.After(s.EndDate) {
@@ -197,10 +190,13 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Update churn epoch based on elapsed time
-		currentChurnEpoch := s.updateChurnEpoch(startTime)
-		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentChurnEpoch)
-		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentChurnEpoch)
+		newEpoch := churnEpochGenerator.GetChurnEpoch()
+		if newEpoch != currentEpoch {
+			log.Printf("Churn epoch advanced from %d to %d", currentEpoch, newEpoch)
+			currentEpoch = newEpoch
+		}
+		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
+		s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentEpoch)
 		current = current.Add(s.Interval)
 		if !s.Infinite {
 			if current.After(s.EndDate) {
@@ -242,30 +238,6 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig *samples.FileC
 		fileConfig.GeneratePermutedTimeSeries(currentTime, churnEpoch, s.Replica, s.ChurnRate, timeSeriesChan)
 	}()
 	return timeSeriesChan
-}
-
-// updateChurnEpoch calculates and updates the current churn epoch based on elapsed time since start
-// and return the current churn epoch
-func (s *SampleLoader) updateChurnEpoch(startTime time.Time) int64 {
-	if s.ChurnInterval <= 0 || s.ChurnRate <= 0 {
-		return 0
-	}
-	elapsed := time.Since(startTime)
-	newEpoch := int64(elapsed / s.ChurnInterval)
-	s.churnMutex.RLock()
-	currentEpoch := s.churnEpoch
-	s.churnMutex.RUnlock()
-
-	if newEpoch == currentEpoch {
-		// No change in churn epoch, return the current epoch
-		return currentEpoch
-	} else {
-		log.Printf("Churn epoch changed from %d to %d", s.churnEpoch, newEpoch)
-		s.churnMutex.Lock()
-		s.churnEpoch = newEpoch
-		s.churnMutex.Unlock()
-		return newEpoch
-	}
 }
 
 func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) {
