@@ -15,8 +15,8 @@ func TestTagSetPermutationStream(t *testing.T) {
 	// Test case 1: Empty labels
 	t.Run("Empty labels", func(t *testing.T) {
 		var labels []samples.LabelCandidates
-		var results []SeriesWithIndex
-		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
+		var results []samples.SeriesWithIndex
+		samples.TagSetPermutationStream(labels, func(swi samples.SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 1
 		if len(results) != expectedCount {
@@ -36,15 +36,15 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"value1"},
 			},
 		}
-		var results []SeriesWithIndex
-		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
+		var results []samples.SeriesWithIndex
+		samples.TagSetPermutationStream(labels, func(swi samples.SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 1
 		if len(results) != expectedCount {
 			t.Errorf("Expected total count %d, got %d", expectedCount, len(results))
 		}
 
-		expectedSeries := []LabelPair{
+		expectedSeries := []samples.LabelPair{
 			{Name: "label1", Value: "value1"},
 		}
 		if !reflect.DeepEqual(results[0].Series, expectedSeries) {
@@ -60,8 +60,8 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"value1", "value2", "value3"},
 			},
 		}
-		var results []SeriesWithIndex
-		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
+		var results []samples.SeriesWithIndex
+		samples.TagSetPermutationStream(labels, func(swi samples.SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 3
 		if len(results) != expectedCount {
@@ -92,8 +92,8 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"x", "y"},
 			},
 		}
-		var results []SeriesWithIndex
-		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
+		var results []samples.SeriesWithIndex
+		samples.TagSetPermutationStream(labels, func(swi samples.SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 4 // 2 * 2 = 4 combinations
 		if len(results) != expectedCount {
@@ -133,8 +133,8 @@ func TestTagSetPermutationStream(t *testing.T) {
 				Values: []string{"web"},
 			},
 		}
-		var results []SeriesWithIndex
-		TagSetPermutationStream(labels, func(swi SeriesWithIndex) { results = append(results, swi) })
+		var results []samples.SeriesWithIndex
+		samples.TagSetPermutationStream(labels, func(swi samples.SeriesWithIndex) { results = append(results, swi) })
 
 		expectedCount := 6 // 2 * 3 * 1 = 6 combinations
 		if len(results) != expectedCount {
