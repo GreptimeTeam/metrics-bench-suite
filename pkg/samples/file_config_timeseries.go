@@ -11,20 +11,8 @@ import (
 
 // GeneratePermutedTimeSeries generates time series for every label permutation in the file config.
 func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch int64, replica int, out chan<- prompb.TimeSeries) {
-	tagOrder := f.TagOrder
-	if len(tagOrder) != len(f.Config.Tags) {
-		tagOrder = make([]int, len(f.Config.Tags))
-		for i := range tagOrder {
-			tagOrder[i] = i
-		}
-		sort.Slice(tagOrder, func(i, j int) bool {
-			return f.Config.Tags[tagOrder[i]].Name < f.Config.Tags[tagOrder[j]].Name
-		})
-	}
-
 	labels := make([]LabelCandidates, 0, len(f.Config.Tags))
-	for _, tagIndex := range tagOrder {
-		tag := f.Config.Tags[tagIndex]
+	for _, tag := range f.Config.Tags {
 		values := tag.Dist.LabelGenerator().All()
 		labels = append(labels, LabelCandidates{
 			Name:   tag.Name,
@@ -34,10 +22,10 @@ func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch in
 
 	seriesIdx := 0
 	replicaInsertIndex := f.ReplicaInsertIndex
-	if len(f.TagOrder) != len(f.Config.Tags) || replicaInsertIndex < 0 || replicaInsertIndex > len(tagOrder) {
+	if replicaInsertIndex < 0 || replicaInsertIndex > len(f.Config.Tags) {
 		replicaInsertIndex = 0
-		for _, idx := range tagOrder {
-			if f.Config.Tags[idx].Name < "replica" {
+		for _, tag := range f.Config.Tags {
+			if tag.Name < "replica" {
 				replicaInsertIndex++
 			} else {
 				break

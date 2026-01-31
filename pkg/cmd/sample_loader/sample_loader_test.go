@@ -1,7 +1,6 @@
 package sample_loader
 
 import (
-	"fmt"
 	"metrics-bench-suite/pkg/samples"
 	"reflect"
 	"sort"
@@ -223,10 +222,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 		},
 	}
 
-	// Test with different pick rates to ensure consistency
-	for _, pickRate := range []float32{1.0, 0.5} {
-		pickRateStr := fmt.Sprintf("%.1f", pickRate)
-		t.Run("PickRate_"+pickRateStr, func(t *testing.T) {
+	t.Run("generateTimeSeries", func(t *testing.T) {
 			currentTime := time.Now()
 			timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
 
@@ -273,7 +269,6 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 				}
 			}
 		})
-	}
 }
 
 func TestNewCommandDoesNotExposeDatabaseFlag(t *testing.T) {
@@ -304,14 +299,14 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 		Config: samples.Config{
 			Tags: []samples.Tag{
 				{
-					Name: "sigma",
+					Name: "alpha",
 					Dist: samples.Distribution{
 						Type:   "weighted_preset",
 						Preset: labelsValues,
 					},
 				},
 				{
-					Name: "alpha",
+					Name: "sigma",
 					Dist: samples.Distribution{
 						Type:   "weighted_preset",
 						Preset: labelsValues,
@@ -329,26 +324,8 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 				},
 			},
 		},
+		ReplicaInsertIndex: 1,
 	}
-
-	fileConfigValue := reflect.ValueOf(&fileConfig).Elem()
-	tagOrderField := fileConfigValue.FieldByName("TagOrder")
-	if !tagOrderField.IsValid() {
-		t.Fatalf("FileConfig missing TagOrder field")
-	}
-	if tagOrderField.Kind() != reflect.Slice {
-		t.Fatalf("FileConfig TagOrder field should be a slice")
-	}
-	tagOrderField.Set(reflect.ValueOf([]int{1, 0}))
-
-	replicaInsertField := fileConfigValue.FieldByName("ReplicaInsertIndex")
-	if !replicaInsertField.IsValid() {
-		t.Fatalf("FileConfig missing ReplicaInsertIndex field")
-	}
-	if replicaInsertField.Kind() != reflect.Int {
-		t.Fatalf("FileConfig ReplicaInsertIndex field should be int")
-	}
-	replicaInsertField.SetInt(1)
 
 	currentTime := time.Now()
 	timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)

@@ -16,7 +16,6 @@ import (
 type FileConfig struct {
 	Name               string
 	Config             Config
-	TagOrder           []int
 	ReplicaInsertIndex int
 	SeriesCount        int
 	ChurnIndices       []int
@@ -76,7 +75,7 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 			log.Printf("Parsing file: %s, num series: %d\n", path, numSeries)
 			totalSeries += numSeries
 
-			tagOrder, replicaInsertIndex, err := computeTagOrderAndReplicaInsertIndex(data.Tags)
+			replicaInsertIndex, err := sortTagsAndComputeReplicaInsertIndex(data.Tags)
 			if err != nil {
 				return err
 			}
@@ -84,7 +83,6 @@ func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]F
 			fileConfigs = append(fileConfigs, FileConfig{
 				Name:               metricName,
 				Config:             data,
-				TagOrder:           tagOrder,
 				ReplicaInsertIndex: replicaInsertIndex,
 				SeriesCount:        numSeries,
 			})
@@ -188,29 +186,27 @@ func buildChurnIndices(count int) []int {
 	return indices
 }
 
-func computeTagOrderAndReplicaInsertIndex(tags []Tag) ([]int, int, error) {
-	order := make([]int, len(tags))
-	for i, tag := range tags {
+func sortTagsAndComputeReplicaInsertIndex(tags []Tag) (int, error) {
+	for _, tag := range tags {
 		if tag.Name == "replica" {
-			return nil, 0, fmt.Errorf("tag name \"replica\" is reserved for sample_loader")
+			return 0, fmt.Errorf("tag name \"replica\" is reserved for sample_loader")
 		}
-		order[i] = i
 	}
 
-	sort.Slice(order, func(i, j int) bool {
-		return tags[order[i]].Name < tags[order[j]].Name
+	sort.Slice(tags, func(i, j int) bool {
+		return tags[i].Name < tags[j].Name
 	})
 
 	insertIndex := 0
-	for _, idx := range order {
-		if tags[idx].Name < "replica" {
+	for _, tag := range tags {
+		if tag.Name < "replica" {
 			insertIndex++
 		} else {
 			break
 		}
 	}
 
-	return order, insertIndex, nil
+	return insertIndex, nil
 }
 
 // WalkAndParseConfig walks a directory and parses all YAML files, returning a list of FileConfig

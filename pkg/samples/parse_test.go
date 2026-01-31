@@ -4,7 +4,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 )
 
@@ -80,26 +79,21 @@ fields:
 		t.Fatalf("expected 1 config, got %d", len(configs))
 	}
 
-	configValue := reflect.ValueOf(configs[0])
-	tagOrderField := configValue.FieldByName("TagOrder")
-	if !tagOrderField.IsValid() {
-		t.Fatalf("FileConfig missing TagOrder field")
+	config := configs[0]
+	expectedTags := []Tag{
+		{Name: "alpha"},
+		{Name: "sigma"},
+		{Name: "zeta"},
 	}
-	replicaIndexField := configValue.FieldByName("ReplicaInsertIndex")
-	if !replicaIndexField.IsValid() {
-		t.Fatalf("FileConfig missing ReplicaInsertIndex field")
+	if len(config.Config.Tags) != len(expectedTags) {
+		t.Fatalf("expected %d tags, got %d", len(expectedTags), len(config.Config.Tags))
 	}
-
-	tagOrder, ok := tagOrderField.Interface().([]int)
-	if !ok {
-		t.Fatalf("TagOrder should be []int")
+	for i, expected := range expectedTags {
+		if config.Config.Tags[i].Name != expected.Name {
+			t.Fatalf("expected tag %d name %q, got %q", i, expected.Name, config.Config.Tags[i].Name)
+		}
 	}
-	expectedOrder := []int{1, 0, 2}
-	if !reflect.DeepEqual(tagOrder, expectedOrder) {
-		t.Fatalf("expected TagOrder %v, got %v", expectedOrder, tagOrder)
-	}
-
-	if replicaIndexField.Int() != 1 {
-		t.Fatalf("expected ReplicaInsertIndex 1, got %d", replicaIndexField.Int())
+	if config.ReplicaInsertIndex != 1 {
+		t.Fatalf("expected ReplicaInsertIndex 1, got %d", config.ReplicaInsertIndex)
 	}
 }
