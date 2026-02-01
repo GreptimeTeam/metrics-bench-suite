@@ -188,17 +188,17 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 		Config: samples.Config{
 			Tags: []samples.Tag{
 				{
-					Name: "region",
-					Dist: samples.Distribution{
-						Type:   "weighted_preset",
-						Preset: regionValues,
-					},
-				},
-				{
 					Name: "env",
 					Dist: samples.Distribution{
 						Type:   "weighted_preset",
 						Preset: envValues,
+					},
+				},
+				{
+					Name: "region",
+					Dist: samples.Distribution{
+						Type:   "weighted_preset",
+						Preset: regionValues,
 					},
 				},
 				{
@@ -220,55 +220,56 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 				},
 			},
 		},
+		ReplicaInsertIndex: 2,
 	}
 
 	t.Run("generateTimeSeries", func(t *testing.T) {
-			currentTime := time.Now()
-			timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
+		currentTime := time.Now()
+		timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
 
-			// Collect all time series
-			timeSeries := make([]prompb.TimeSeries, 0)
-			for ts := range timeSeriesChan {
-				timeSeries = append(timeSeries, ts)
+		// Collect all time series
+		timeSeries := make([]prompb.TimeSeries, 0)
+		for ts := range timeSeriesChan {
+			timeSeries = append(timeSeries, ts)
+		}
+
+		// Verify that there are time series generated
+		if len(timeSeries) == 0 {
+			t.Error("Expected at least one time series to be generated")
+			return
+		}
+
+		// For each time series, verify the requirements
+		for _, ts := range timeSeries {
+			// Check 1: First label is '__name__'
+			if len(ts.Labels) == 0 {
+				t.Error("Time series has no labels")
+				continue
 			}
 
-			// Verify that there are time series generated
-			if len(timeSeries) == 0 {
-				t.Error("Expected at least one time series to be generated")
-				return
+			if ts.Labels[0].Name != "__name__" {
+				t.Errorf("First label should be '__name__', got '%s'", ts.Labels[0].Name)
 			}
 
-			// For each time series, verify the requirements
-			for _, ts := range timeSeries {
-				// Check 1: First label is '__name__'
-				if len(ts.Labels) == 0 {
-					t.Error("Time series has no labels")
-					continue
-				}
+			if ts.Labels[0].Value != "test_metric" {
+				t.Errorf("First label value should be 'test_metric', got '%s'", ts.Labels[0].Value)
+			}
 
-				if ts.Labels[0].Name != "__name__" {
-					t.Errorf("First label should be '__name__', got '%s'", ts.Labels[0].Name)
-				}
+			// Check 2: Other labels (excluding __name__) are sorted lexicographically
+			labelsAfterName := make([]prompb.Label, 0)
+			for _, label := range ts.Labels[1:] { // Skip the first __name__ label
+				labelsAfterName = append(labelsAfterName, label)
+			}
 
-				if ts.Labels[0].Value != "test_metric" {
-					t.Errorf("First label value should be 'test_metric', got '%s'", ts.Labels[0].Value)
-				}
-
-				// Check 2: Other labels (excluding __name__) are sorted lexicographically
-				labelsAfterName := make([]prompb.Label, 0)
-				for _, label := range ts.Labels[1:] { // Skip the first __name__ label
-					labelsAfterName = append(labelsAfterName, label)
-				}
-
-				// Verify labels are sorted lexicographically (excluding __name__)
-				for i := 0; i < len(labelsAfterName)-1; i++ {
-					if labelsAfterName[i].Name > labelsAfterName[i+1].Name {
-						t.Errorf("Labels are not sorted lexicographically: '%s' > '%s'",
-							labelsAfterName[i].Name, labelsAfterName[i+1].Name)
-					}
+			// Verify labels are sorted lexicographically (excluding __name__)
+			for i := 0; i < len(labelsAfterName)-1; i++ {
+				if labelsAfterName[i].Name > labelsAfterName[i+1].Name {
+					t.Errorf("Labels are not sorted lexicographically: '%s' > '%s'",
+						labelsAfterName[i].Name, labelsAfterName[i+1].Name)
 				}
 			}
-		})
+		}
+	})
 }
 
 func TestNewCommandDoesNotExposeDatabaseFlag(t *testing.T) {

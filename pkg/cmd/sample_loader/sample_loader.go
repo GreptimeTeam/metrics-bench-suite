@@ -194,7 +194,6 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	for range ticker.C {
 		newEpoch := churnEpochGenerator.GetChurnEpoch()
 		if newEpoch != currentEpoch {
-			log.Printf("Churn epoch advanced from %d to %d", currentEpoch, newEpoch)
 			currentEpoch = newEpoch
 		}
 		log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
