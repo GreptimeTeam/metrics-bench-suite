@@ -38,7 +38,7 @@ go-lint:
 # Docker build and push
 REGISTRY ?= greptime-registry.cn-hangzhou.cr.aliyuncs.com
 REPO ?= tools/metrics-bench-suite
-TAG ?= 0.3
+TAG ?= 0.3.1
 IMAGE_NAME := $(REGISTRY)/$(REPO):$(TAG)
 
 docker-build-push:
