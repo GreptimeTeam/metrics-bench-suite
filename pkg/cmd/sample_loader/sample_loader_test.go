@@ -10,6 +10,26 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 )
 
+func TestAuthorizationHeader(t *testing.T) {
+	s := &SampleLoader{
+		Username: "alice",
+		Password: "secret",
+	}
+
+	expected := "Basic YWxpY2U6c2VjcmV0"
+	if got := s.authorizationHeader(); got != expected {
+		t.Fatalf("expected authorization header %q, got %q", expected, got)
+	}
+}
+
+func TestAuthorizationHeaderEmpty(t *testing.T) {
+	s := &SampleLoader{}
+
+	if got := s.authorizationHeader(); got != "" {
+		t.Fatalf("expected empty authorization header, got %q", got)
+	}
+}
+
 func TestTagSetPermutationStream(t *testing.T) {
 	// Test case 1: Empty labels
 	t.Run("Empty labels", func(t *testing.T) {

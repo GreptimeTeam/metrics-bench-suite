@@ -1,6 +1,7 @@
 package sample_loader
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
 	"math"
@@ -29,6 +30,8 @@ type SampleLoader struct {
 	TablePickCount uint64
 	DryRun         bool
 	Replica        int
+	Username       string
+	Password       string
 	// ChurnRate is the fraction (0.0–1.0) of time series that will be churned at each churn event.
 	ChurnRate float64
 	// ChurnInterval is the duration between churn events.
@@ -96,6 +99,17 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	s.Username, err = cmd.Flags().GetString("username")
+	if err != nil {
+		return err
+	}
+	s.Password, err = cmd.Flags().GetString("password")
+	if err != nil {
+		return err
+	}
+	if (s.Username == "") != (s.Password == "") {
+		return fmt.Errorf("username and password must be provided together")
+	}
 	s.DryRun, err = cmd.Flags().GetBool("dry-run")
 	if err != nil {
 		return err
@@ -133,6 +147,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	log.Printf("Table pick rate: %d", s.TablePickCount)
 	log.Printf("Replica label value: %d", s.Replica)
 	log.Printf("Dry run: %t", s.DryRun)
+	log.Printf("Authorization enabled: %t", s.authorizationHeader() != "")
 	log.Printf("Churn rate: %f", s.ChurnRate)
 	log.Printf("Churn interval: %s", s.ChurnInterval)
 
@@ -153,7 +168,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	wg := sync.WaitGroup{}
 	for i := 0; i < s.Workers; i++ {
 		wg.Add(1)
-		go worker(i, s.RemoteWriteURL, requestChan, &wg, s.DryRun)
+		go worker(i, s.RemoteWriteURL, s.authorizationHeader(), requestChan, &wg, s.DryRun)
 	}
 
 	current := s.StartDate
@@ -213,7 +228,15 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func worker(id int, url string, request <-chan prompb.WriteRequest, wg *sync.WaitGroup, dryRun bool) {
+func (s *SampleLoader) authorizationHeader() string {
+	if s.Username == "" && s.Password == "" {
+		return ""
+	}
+	authInfo := fmt.Sprintf("%s:%s", s.Username, s.Password)
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(authInfo))
+}
+
+func worker(id int, url string, authorizationHeader string, request <-chan prompb.WriteRequest, wg *sync.WaitGroup, dryRun bool) {
 	defer wg.Done()
 	for request := range request {
 		numSeries := len(request.Timeseries)
@@ -222,6 +245,9 @@ func worker(id int, url string, request <-chan prompb.WriteRequest, wg *sync.Wai
 		} else {
 			now := time.Now()
 			r := http.NewRequester(url)
+			if authorizationHeader != "" {
+				r.SetHeader("Authorization", authorizationHeader)
+			}
 			err := r.Send(request)
 			if err != nil {
 				log.Printf("worker %d failed to send write request: %v", id, err)
@@ -309,6 +335,8 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().StringP("tick-interval", "t", "30s", "The interval of the requests")
 	rootCmd.Flags().IntP("workers", "w", 1, "The number of workers to send requests")
 	rootCmd.Flags().IntP("replica", "r", 0, "The replica tab value of current instance")
+	rootCmd.Flags().String("username", "", "The username for HTTP Basic authorization")
+	rootCmd.Flags().String("password", "", "The password for HTTP Basic authorization")
 	rootCmd.Flags().BoolP("infinite", "i", false, "Run indefinitely")
 	rootCmd.Flags().Uint64P("table-pick-count", "n", math.MaxUint64, "The number of tables to pick from")
 	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")

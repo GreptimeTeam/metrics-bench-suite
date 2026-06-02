@@ -15,6 +15,7 @@ import (
 type Requester struct {
 	URL    string
 	Client *http.Client
+	Header http.Header
 }
 
 // NewRequester creates a new requester
@@ -22,7 +23,13 @@ func NewRequester(url string) *Requester {
 	return &Requester{
 		URL:    url,
 		Client: &http.Client{},
+		Header: make(http.Header),
 	}
+}
+
+// SetHeader sets a header on every request sent by this requester.
+func (r *Requester) SetHeader(key, value string) {
+	r.Header.Set(key, value)
 }
 
 // Send sends a write request to the remote write endpoint
@@ -39,6 +46,11 @@ func (r *Requester) Send(writeRequest prompb.WriteRequest) error {
 
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Content-Encoding", "snappy")
+	for key, values := range r.Header {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 
 	resp, err := r.Client.Do(req)
 	if err != nil {
