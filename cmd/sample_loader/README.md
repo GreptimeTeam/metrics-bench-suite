@@ -10,6 +10,12 @@ Generate and load the sample data from the config file.
 ./bin/sample_loader -c ./configs/debug_samples_400 -u  http://localhost:4000/v1/prometheus/write\?db\=public --start-date 2025-03-09T18:00:00+08:00 --end-date 2025-03-09T19:00:00+08:00 --interval 30s  --tick-interval 1s
 ```
 
+With HTTP Basic authorization:
+
+```bash
+./bin/sample_loader -c ./configs/debug_samples_400 -u http://localhost:4000/v1/prometheus/write\?db\=public --username myuser --password mypassword
+```
+
 #### Configs
 `./configs/debug_samples` total time series 4k.
 `./configs/debug_samples_400` total time series 400k.
