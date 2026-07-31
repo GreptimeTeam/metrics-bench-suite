@@ -1,9 +1,14 @@
 package sample_loader
 
 import (
+	"bytes"
+	"log"
 	"metrics-bench-suite/pkg/samples"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +32,80 @@ func TestAuthorizationHeaderEmpty(t *testing.T) {
 
 	if got := s.authorizationHeader(); got != "" {
 		t.Fatalf("expected empty authorization header, got %q", got)
+	}
+}
+
+func TestParseRemoteWriteVersion(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected remoteWriteVersion
+	}{
+		{input: "v1", expected: remoteWriteV1},
+		{input: "v2", expected: remoteWriteV2},
+	}
+
+	for _, test := range tests {
+		got, err := parseRemoteWriteVersion(test.input)
+		if err != nil {
+			t.Fatalf("parse %q: %v", test.input, err)
+		}
+		if got != test.expected {
+			t.Fatalf("parse %q: expected %d, got %d", test.input, test.expected, got)
+		}
+	}
+
+	if _, err := parseRemoteWriteVersion("v3"); err == nil {
+		t.Fatal("expected unsupported version error")
+	}
+}
+
+func TestConvertToRemoteWriteV2Request(t *testing.T) {
+	request := prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "cpu_usage"},
+					{Name: "instance", Value: "a"},
+				},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: 2},
+					{Value: 3, Timestamp: 4},
+				},
+			},
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "cpu_usage"},
+					{Name: "instance", Value: "b"},
+				},
+				Samples: []prompb.Sample{{Value: 5, Timestamp: 6}},
+			},
+		},
+	}
+
+	got := convertToRemoteWriteV2Request(request)
+	expectedSymbols := []string{"", "__name__", "cpu_usage", "instance", "a", "b"}
+	if !reflect.DeepEqual(got.Symbols, expectedSymbols) {
+		t.Fatalf("expected symbols %v, got %v", expectedSymbols, got.Symbols)
+	}
+	if got.Symbols[0] != "" {
+		t.Fatalf("expected empty first symbol, got %q", got.Symbols[0])
+	}
+
+	expectedLabelRefs := [][]uint32{{1, 2, 3, 4}, {1, 2, 3, 5}}
+	for i := range got.Timeseries {
+		if !reflect.DeepEqual(got.Timeseries[i].LabelsRefs, expectedLabelRefs[i]) {
+			t.Fatalf("series %d: expected label refs %v, got %v", i, expectedLabelRefs[i], got.Timeseries[i].LabelsRefs)
+		}
+		if len(got.Timeseries[i].Samples) != len(request.Timeseries[i].Samples) {
+			t.Fatalf("series %d: expected %d samples, got %d", i, len(request.Timeseries[i].Samples), len(got.Timeseries[i].Samples))
+		}
+		for j := range got.Timeseries[i].Samples {
+			expected := request.Timeseries[i].Samples[j]
+			actual := got.Timeseries[i].Samples[j]
+			if actual.Value != expected.Value || actual.Timestamp != expected.Timestamp {
+				t.Fatalf("series %d sample %d: expected %+v, got %+v", i, j, expected, actual)
+			}
+		}
 	}
 }
 
@@ -296,6 +375,82 @@ func TestNewCommandDoesNotExposeDatabaseFlag(t *testing.T) {
 	cmd := NewCommand()
 	if flag := cmd.Flags().Lookup("database"); flag != nil {
 		t.Fatalf("expected no database flag, got %q", flag.Name)
+	}
+}
+
+func TestRunWithDurationStops(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	configPath := filepath.Join(t.TempDir(), "test.yaml")
+	config := []byte(`tags:
+  - name: instance
+    type: string
+    dist:
+      type: constant_string
+      value: test
+fields:
+  - name: value
+    type: float
+    dist:
+      type: uniform
+      lower_bound: 0
+      upper_bound: 1
+`)
+	if err := os.WriteFile(configPath, config, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"config":               configPath,
+		"dry-run":              "true",
+		"duration":             "20ms",
+		"interval":             "1s",
+		"remote-write-version": "v2",
+		"tick-interval":        "50ms",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
+	}
+
+	start := time.Now()
+	if err := (&SampleLoader{}).run(cmd, nil); err != nil {
+		t.Fatalf("run loader: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("duration run took too long: %s", elapsed)
+	}
+	for _, expected := range []string{
+		"Run statistics:",
+		"requests_total=1 requests_succeeded=1 requests_failed=0",
+		"samples_total=1 samples_in_succeeded_requests=1 samples_in_failed_requests=0",
+		"dry_run=true",
+	} {
+		if !strings.Contains(logs.String(), expected) {
+			t.Fatalf("expected log output to contain %q, got:\n%s", expected, logs.String())
+		}
+	}
+}
+
+func TestRunRejectsDurationWithInfinite(t *testing.T) {
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"dry-run":  "true",
+		"duration": "60s",
+		"infinite": "true",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
+	}
+
+	err := (&SampleLoader{}).run(cmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Fatalf("expected incompatible flags error, got %v", err)
 	}
 }
 
