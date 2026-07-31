@@ -1,6 +1,7 @@
 package samples
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -11,6 +12,11 @@ import (
 
 // GeneratePermutedTimeSeries generates time series for every label permutation in the file config.
 func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch int64, replica int, out chan<- prompb.TimeSeries) {
+	f.GeneratePermutedTimeSeriesContext(context.Background(), current, churnEpoch, replica, out)
+}
+
+// GeneratePermutedTimeSeriesContext generates time series until complete or canceled.
+func (f *FileConfig) GeneratePermutedTimeSeriesContext(ctx context.Context, current time.Time, churnEpoch int64, replica int, out chan<- prompb.TimeSeries) {
 	labels := make([]LabelCandidates, 0, len(f.Config.Tags))
 	for _, tag := range f.Config.Tags {
 		values := tag.Dist.LabelGenerator().All()
@@ -33,10 +39,18 @@ func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch in
 		}
 	}
 
-	TagSetPermutationStream(labels, func(seriesWithIndex SeriesWithIndex) {
+	tagSetPermutationStream(labels, func(seriesWithIndex SeriesWithIndex) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		ts := f.processSingleFileConfigSeries(seriesWithIndex, seriesIdx, replicaInsertIndex, current, churnEpoch, replica)
-		out <- ts
-		seriesIdx++
+		select {
+		case out <- ts:
+			seriesIdx++
+			return true
+		case <-ctx.Done():
+			return false
+		}
 	})
 }
 

@@ -1,6 +1,7 @@
 package sample_loader
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -8,6 +9,8 @@ import (
 	"math/rand/v2"
 	"metrics-bench-suite/pkg/http"
 	"metrics-bench-suite/pkg/samples"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +25,9 @@ const (
 	remoteWriteV1 remoteWriteVersion = iota
 	remoteWriteV2
 )
+
+// ponytail: fixed grace keeps shutdown bounded; add a flag only if receiver latency needs tuning.
+const drainGracePeriod = 30 * time.Second
 
 func parseRemoteWriteVersion(value string) (remoteWriteVersion, error) {
 	switch value {
@@ -39,14 +45,24 @@ type runStats struct {
 	samples                 uint64
 	failedRequests          uint64
 	samplesInFailedRequests uint64
+	requestTimeTotal        time.Duration
+	requestTimeMin          time.Duration
+	requestTimeMax          time.Duration
 }
 
-func (s *runStats) record(samples uint64, failed bool) {
+func (s *runStats) record(samples uint64, failed bool, requestTime time.Duration) {
 	if s == nil {
 		return
 	}
 	s.requests++
 	s.samples += samples
+	s.requestTimeTotal += requestTime
+	if s.requests == 1 || requestTime < s.requestTimeMin {
+		s.requestTimeMin = requestTime
+	}
+	if requestTime > s.requestTimeMax {
+		s.requestTimeMax = requestTime
+	}
 	if failed {
 		s.failedRequests++
 		s.samplesInFailedRequests += samples
@@ -60,6 +76,16 @@ func logRunStats(statsByWorker []runStats, elapsed time.Duration, dryRun bool) {
 		total.samples += stats.samples
 		total.failedRequests += stats.failedRequests
 		total.samplesInFailedRequests += stats.samplesInFailedRequests
+		if stats.requests == 0 {
+			continue
+		}
+		total.requestTimeTotal += stats.requestTimeTotal
+		if stats.requestTimeMin < total.requestTimeMin || total.requestTimeMin == 0 {
+			total.requestTimeMin = stats.requestTimeMin
+		}
+		if stats.requestTimeMax > total.requestTimeMax {
+			total.requestTimeMax = stats.requestTimeMax
+		}
 	}
 
 	successfulRequests := total.requests - total.failedRequests
@@ -68,18 +94,59 @@ func logRunStats(statsByWorker []runStats, elapsed time.Duration, dryRun bool) {
 	if elapsed > 0 {
 		samplesPerSecond = float64(samplesInSuccessfulRequests) / elapsed.Seconds()
 	}
-	log.Printf(
-		"Run statistics: elapsed=%s requests_total=%d requests_succeeded=%d requests_failed=%d samples_total=%d samples_in_succeeded_requests=%d samples_in_failed_requests=%d samples_per_second=%.2f dry_run=%t",
-		elapsed.Round(time.Millisecond),
-		total.requests,
-		successfulRequests,
-		total.failedRequests,
-		total.samples,
-		samplesInSuccessfulRequests,
-		total.samplesInFailedRequests,
-		samplesPerSecond,
-		dryRun,
-	)
+
+	rows := [][2]string{
+		{"elapsed:", elapsed.Round(time.Millisecond).String()},
+		{"requests_total:", strconv.FormatUint(total.requests, 10)},
+		{"requests_succeeded:", strconv.FormatUint(successfulRequests, 10)},
+		{"requests_failed:", strconv.FormatUint(total.failedRequests, 10)},
+		{"samples_total:", strconv.FormatUint(total.samples, 10)},
+		{"samples_in_succeeded_requests:", strconv.FormatUint(samplesInSuccessfulRequests, 10)},
+		{"samples_in_failed_requests:", strconv.FormatUint(total.samplesInFailedRequests, 10)},
+		{"samples_per_second:", fmt.Sprintf("%.2f", samplesPerSecond)},
+	}
+	if !dryRun && total.requests > 0 {
+		requestTimeAvg := total.requestTimeTotal / time.Duration(total.requests)
+		rows = append(rows,
+			[2]string{"request_time_total:", total.requestTimeTotal.Round(time.Microsecond).String()},
+			[2]string{"request_time_avg:", requestTimeAvg.Round(time.Microsecond).String()},
+			[2]string{"request_time_min:", total.requestTimeMin.Round(time.Microsecond).String()},
+			[2]string{"request_time_max:", total.requestTimeMax.Round(time.Microsecond).String()},
+		)
+	}
+	rows = append(rows, [2]string{"dry_run:", strconv.FormatBool(dryRun)})
+
+	width := 0
+	for _, row := range rows {
+		if len(row[0]) > width {
+			width = len(row[0])
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("Run statistics:\n")
+	for _, row := range rows {
+		fmt.Fprintf(&b, "  %-*s %s\n", width, row[0], row[1])
+	}
+	log.Print(b.String())
+}
+
+func waitForWorkers(wg *sync.WaitGroup, cancel context.CancelFunc, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		log.Printf("Drain timeout reached, canceling unfinished requests")
+		cancel()
+		<-done
+	}
 }
 
 // SampleLoader generates samples from config files and sends them to a remote-write endpoint.
@@ -241,6 +308,8 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if duration > 0 {
 		statsByWorker = make([]runStats, s.Workers)
 	}
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
 	wg := sync.WaitGroup{}
 	for i := 0; i < s.Workers; i++ {
 		var stats *runStats
@@ -248,7 +317,7 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 			stats = &statsByWorker[i]
 		}
 		wg.Add(1)
-		go worker(i, s.RemoteWriteURL, s.authorizationHeader(), version, requestChan, &wg, s.DryRun, stats)
+		go worker(requestCtx, i, s.RemoteWriteURL, s.authorizationHeader(), version, requestChan, &wg, s.DryRun, stats)
 	}
 
 	current := s.StartDate
@@ -267,25 +336,22 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 		time.Sleep(jitter)
 	}
 
-	var (
-		durationTimer *time.Timer
-		durationDone  <-chan time.Time
-		durationStart time.Time
-		deadline      time.Time
-	)
+	generationCtx := context.Background()
+	var durationStart time.Time
 	if duration > 0 {
 		durationStart = time.Now()
-		deadline = durationStart.Add(duration)
-		durationTimer = time.NewTimer(time.Until(deadline))
-		durationDone = durationTimer.C
-		defer durationTimer.Stop()
+		var cancel context.CancelFunc
+		generationCtx, cancel = context.WithTimeout(generationCtx, duration)
+		defer cancel()
 	}
 
 	finish := func() error {
 		close(requestChan)
-		wg.Wait()
 		if duration > 0 {
+			waitForWorkers(&wg, cancelRequests, drainGracePeriod)
 			logRunStats(statsByWorker, time.Since(durationStart), s.DryRun)
+		} else {
+			wg.Wait()
 		}
 		return nil
 	}
@@ -296,7 +362,10 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 
 	// First generation immediately after jitter
 	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
-	s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentEpoch)
+	if !s.convertToRemoteWriteRequestsStreaming(generationCtx, fileConfigs, current, requestChan, currentEpoch) {
+		log.Printf("Duration reached, stopping")
+		return finish()
+	}
 	current = current.Add(s.Interval)
 	if !live {
 		if current.After(s.EndDate) {
@@ -312,22 +381,21 @@ runLoop:
 	for {
 		select {
 		case <-ticker.C:
-			if !deadline.IsZero() && !time.Now().Before(deadline) {
-				log.Printf("Duration reached, stopping")
-				break runLoop
-			}
 			newEpoch := churnEpochGenerator.GetChurnEpoch()
 			if newEpoch != currentEpoch {
 				currentEpoch = newEpoch
 			}
 			log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
-			s.convertToRemoteWriteRequestsStreaming(fileConfigs, current, requestChan, currentEpoch)
+			if !s.convertToRemoteWriteRequestsStreaming(generationCtx, fileConfigs, current, requestChan, currentEpoch) {
+				log.Printf("Duration reached, stopping")
+				break runLoop
+			}
 			current = current.Add(s.Interval)
 			if !live && current.After(s.EndDate) {
 				log.Printf("End date reached, stopping")
 				break runLoop
 			}
-		case <-durationDone:
+		case <-generationCtx.Done():
 			log.Printf("Duration reached, stopping")
 			break runLoop
 		}
@@ -344,15 +412,19 @@ func (s *SampleLoader) authorizationHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(authInfo))
 }
 
-func worker(id int, url string, authorizationHeader string, version remoteWriteVersion, request <-chan prompb.WriteRequest, wg *sync.WaitGroup, dryRun bool, stats *runStats) {
+func worker(ctx context.Context, id int, url string, authorizationHeader string, version remoteWriteVersion, request <-chan prompb.WriteRequest, wg *sync.WaitGroup, dryRun bool, stats *runStats) {
 	defer wg.Done()
 	for request := range request {
+		if ctx.Err() != nil {
+			return
+		}
 		numSeries := len(request.Timeseries)
 		numSamples := uint64(0)
 		for i := range request.Timeseries {
 			numSamples += uint64(len(request.Timeseries[i].Samples))
 		}
 		failed := false
+		var requestTime time.Duration
 		if dryRun {
 			log.Printf("worker %d (dry-run) would send request with num series: %d", id, numSeries)
 		} else {
@@ -364,20 +436,21 @@ func worker(id int, url string, authorizationHeader string, version remoteWriteV
 			var err error
 			switch version {
 			case remoteWriteV1:
-				err = r.Send(request)
+				err = r.SendContext(ctx, request)
 			case remoteWriteV2:
-				err = r.SendV2(convertToRemoteWriteV2Request(request))
+				err = r.SendV2Context(ctx, convertToRemoteWriteV2Request(request))
 			default:
 				err = fmt.Errorf("unsupported remote write version: %d", version)
 			}
+			requestTime = time.Since(now)
 			if err != nil {
 				log.Printf("worker %d failed to send write request: %v", id, err)
 				failed = true
 			} else {
-				log.Printf("worker %d sent request in %s, num series: %d", id, time.Since(now), numSeries)
+				log.Printf("worker %d sent request in %s, num series: %d", id, requestTime, numSeries)
 			}
 		}
-		stats.record(numSamples, failed)
+		stats.record(numSamples, failed, requestTime)
 	}
 }
 
@@ -414,16 +487,16 @@ func convertToRemoteWriteV2Request(request prompb.WriteRequest) writev2.Request 
 }
 
 // generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
-func (s *SampleLoader) generateTimeSeriesForFileConfig(fileConfig *samples.FileConfig, currentTime time.Time, churnEpoch int64) <-chan prompb.TimeSeries {
+func (s *SampleLoader) generateTimeSeriesForFileConfig(ctx context.Context, fileConfig *samples.FileConfig, currentTime time.Time, churnEpoch int64) <-chan prompb.TimeSeries {
 	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
 	go func() {
 		defer close(timeSeriesChan)
-		fileConfig.GeneratePermutedTimeSeries(currentTime, churnEpoch, s.Replica, timeSeriesChan)
+		fileConfig.GeneratePermutedTimeSeriesContext(ctx, currentTime, churnEpoch, s.Replica, timeSeriesChan)
 	}()
 	return timeSeriesChan
 }
 
-func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) {
+func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) bool {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -434,10 +507,14 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 		go func(fc *samples.FileConfig) {
 			defer wg.Done()
 			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(fc, currentTime, churnEpoch)
+			tsChan := s.generateTimeSeriesForFileConfig(ctx, fc, currentTime, churnEpoch)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
-				timeSeriesChan <- ts
+				select {
+				case timeSeriesChan <- ts:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}(&fileConfigs[i])
 	}
@@ -448,25 +525,42 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 		close(timeSeriesChan)
 	}()
 
+	enqueue := func(timeSeries []prompb.TimeSeries) bool {
+		select {
+		case requestChan <- prompb.WriteRequest{Timeseries: timeSeries}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	// Collect time series and send in batches
 	tsSet := make([]prompb.TimeSeries, 0, s.MaxSamples)
 	for ts := range timeSeriesChan {
+		if ctx.Err() != nil {
+			continue
+		}
 		tsSet = append(tsSet, ts)
 		if len(tsSet) >= s.MaxSamples {
 			// Send a batch when we reach maxSamples
-			requestChan <- prompb.WriteRequest{
-				Timeseries: tsSet,
+			if !enqueue(tsSet) {
+				for range timeSeriesChan {
+				}
+				return false
 			}
 			tsSet = make([]prompb.TimeSeries, 0, s.MaxSamples) // Reset the slice
 		}
 	}
 
+	if ctx.Err() != nil {
+		return false
+	}
+
 	// Send any remaining time series
 	if len(tsSet) > 0 {
-		requestChan <- prompb.WriteRequest{
-			Timeseries: tsSet,
-		}
+		return enqueue(tsSet)
 	}
+	return true
 }
 
 func NewCommand() *cobra.Command {

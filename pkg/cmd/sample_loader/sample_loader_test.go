@@ -2,13 +2,19 @@ package sample_loader
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"log"
 	"metrics-bench-suite/pkg/samples"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -324,7 +330,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 
 	t.Run("generateTimeSeries", func(t *testing.T) {
 		currentTime := time.Now()
-		timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
+		timeSeriesChan := s.generateTimeSeriesForFileConfig(context.Background(), &fileConfig, currentTime, 0)
 
 		// Collect all time series
 		timeSeries := make([]prompb.TimeSeries, 0)
@@ -426,13 +432,94 @@ fields:
 	}
 	for _, expected := range []string{
 		"Run statistics:",
-		"requests_total=1 requests_succeeded=1 requests_failed=0",
-		"samples_total=1 samples_in_succeeded_requests=1 samples_in_failed_requests=0",
-		"dry_run=true",
+		`requests_total:\s+1`,
+		`requests_succeeded:\s+1`,
+		`requests_failed:\s+0`,
+		`samples_total:\s+1`,
+		`samples_in_succeeded_requests:\s+1`,
+		`samples_in_failed_requests:\s+0`,
+		`dry_run:\s+true`,
 	} {
-		if !strings.Contains(logs.String(), expected) {
+		if !regexp.MustCompile(expected).MatchString(logs.String()) {
 			t.Fatalf("expected log output to contain %q, got:\n%s", expected, logs.String())
 		}
+	}
+}
+
+func TestDurationStopsBlockedGeneration(t *testing.T) {
+	preset := make([]samples.PresetItem, 100)
+	for i := range preset {
+		preset[i] = samples.PresetItem{Value: fmt.Sprintf("instance-%d", i), Weight: 1}
+	}
+	fileConfigs := []samples.FileConfig{{
+		Name: "test_metric",
+		Config: samples.Config{
+			Tags: []samples.Tag{{
+				Name: "instance",
+				Dist: samples.Distribution{Type: "weighted_preset", Preset: preset},
+			}},
+			Fields: []samples.Field{{
+				Name: "value",
+				Dist: samples.Distribution{Type: "constant_float", Value: 1.0},
+			}},
+		},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() {
+		done <- (&SampleLoader{MaxSamples: 1}).convertToRemoteWriteRequestsStreaming(
+			ctx,
+			fileConfigs,
+			time.Now(),
+			make(chan prompb.WriteRequest),
+			0,
+		)
+	}()
+
+	select {
+	case completed := <-done:
+		if completed {
+			t.Fatal("expected generation to stop at the deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("generation did not stop at the deadline")
+	}
+}
+
+func TestWorkerCancelsAfterDrainTimeout(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	requestChan := make(chan prompb.WriteRequest, 1)
+	requestChan <- prompb.WriteRequest{}
+	close(requestChan)
+
+	var (
+		wg    sync.WaitGroup
+		stats runStats
+	)
+	wg.Add(1)
+	go worker(requestCtx, 0, server.URL, "", remoteWriteV1, requestChan, &wg, false, &stats)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start its request")
+	}
+
+	waitForWorkers(&wg, cancelRequests, 20*time.Millisecond)
+	if stats.failedRequests != 1 {
+		t.Fatalf("expected the canceled request to fail, got %+v", stats)
 	}
 }
 
@@ -504,7 +591,7 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 	}
 
 	currentTime := time.Now()
-	timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
+	timeSeriesChan := s.generateTimeSeriesForFileConfig(context.Background(), &fileConfig, currentTime, 0)
 
 	var timeSeries []prompb.TimeSeries
 	for ts := range timeSeriesChan {

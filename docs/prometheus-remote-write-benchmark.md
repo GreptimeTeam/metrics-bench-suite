@@ -75,9 +75,10 @@ GreptimeDB instance:
   --replica 0
 ```
 
-This generates live samples for 60 seconds, then stops creating waves and
-drains queued requests before exiting. Use `--infinite` instead to run until
-interrupted with `Ctrl-C`; the two flags cannot be combined.
+This generates live samples for 60 seconds, then stops generating the current
+wave and drains queued requests for up to 30 seconds before canceling
+unfinished requests. Use `--infinite` instead to run until interrupted with
+`Ctrl-C`; the two flags cannot be combined.
 
 For HTTP Basic authentication, add both flags:
 
@@ -155,9 +156,8 @@ total samples = S * waves
 
 The request channel applies backpressure. If the receiver cannot keep up, actual
 throughput falls below the configured offered rate instead of growing an
-unbounded request queue. Duration is checked between waves, and queued requests
-are drained before exit, so a slow wave or receiver can make total process time
-slightly longer than `--duration`.
+unbounded request queue. The duration deadline also stops an in-progress wave;
+queued requests then drain for up to 30 seconds before cancellation.
 
 ## Bundled workload sizes
 
@@ -244,7 +244,7 @@ The loader logs request duration, worker number, and series count:
 worker 0 sent request in 42ms, num series: 5000
 ```
 
-After a duration run stops generating waves and drains queued requests, it logs
+After a duration run stops generation and finishes its bounded drain, it logs
 client-side totals and throughput:
 
 ```text

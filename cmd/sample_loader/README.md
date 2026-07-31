@@ -17,9 +17,10 @@ Remote write v1 is the default. To send `io.prometheus.write.v2.Request`:
 ```
 
 Use `--duration 60s` to generate live samples for a finite wall-clock duration.
-It cannot be combined with `--infinite`. After queued requests drain, the
-loader prints request and sample totals, failures, and samples in successful
-requests per second.
+It cannot be combined with `--infinite`. Generation stops at the deadline;
+queued requests then drain for up to 30 seconds before unfinished requests are
+canceled. The loader prints request and sample totals, failures, and samples
+in successful requests per second.
 
 With HTTP Basic authorization:
 

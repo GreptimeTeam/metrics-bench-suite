@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,23 +46,33 @@ func (r *Requester) SetHeader(key, value string) {
 
 // Send sends a write request to the remote write endpoint
 func (r *Requester) Send(writeRequest prompb.WriteRequest) error {
+	return r.SendContext(context.Background(), writeRequest)
+}
+
+// SendContext sends a write request with cancellation.
+func (r *Requester) SendContext(ctx context.Context, writeRequest prompb.WriteRequest) error {
 	protobufData, err := writeRequest.Marshal()
 	if err != nil {
 		return err
 	}
 
-	_, err = r.send(protobufData, contentTypeV1, remoteWriteVersionV1)
+	_, err = r.send(ctx, protobufData, contentTypeV1, remoteWriteVersionV1)
 	return err
 }
 
 // SendV2 sends a Prometheus remote write 2.0 request.
 func (r *Requester) SendV2(writeRequest writev2.Request) error {
+	return r.SendV2Context(context.Background(), writeRequest)
+}
+
+// SendV2Context sends a Prometheus remote write 2.0 request with cancellation.
+func (r *Requester) SendV2Context(ctx context.Context, writeRequest writev2.Request) error {
 	protobufData, err := writeRequest.OptimizedMarshal(nil)
 	if err != nil {
 		return err
 	}
 
-	headers, err := r.send(protobufData, contentTypeV2, remoteWriteVersionV2)
+	headers, err := r.send(ctx, protobufData, contentTypeV2, remoteWriteVersionV2)
 	if err != nil {
 		return err
 	}
@@ -86,9 +97,9 @@ func (r *Requester) SendV2(writeRequest writev2.Request) error {
 	return nil
 }
 
-func (r *Requester) send(protobufData []byte, contentType, remoteWriteVersion string) (http.Header, error) {
+func (r *Requester) send(ctx context.Context, protobufData []byte, contentType, remoteWriteVersion string) (http.Header, error) {
 	compressedData := snappy.Encode(nil, protobufData)
-	req, err := http.NewRequest("POST", r.URL, bytes.NewBuffer(compressedData))
+	req, err := http.NewRequestWithContext(ctx, "POST", r.URL, bytes.NewBuffer(compressedData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %v", err)
 	}
@@ -105,7 +116,7 @@ func (r *Requester) send(protobufData []byte, contentType, remoteWriteVersion st
 
 	resp, err := r.Client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send HTTP request: %v", err)
+		return nil, fmt.Errorf("failed to send HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
