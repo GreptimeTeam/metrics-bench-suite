@@ -1,0 +1,53 @@
+pkg/cmd/partition_query_loader/model.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/partition_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/workload_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/observations_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/query_plan.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/workload.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/command_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/output_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/config_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/output.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/discovery_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+cmd/partition_query_loader/main.go
+  s_beda43da85456a::t_b7a58f6973077d 6
+pkg/cmd/partition_query_loader/discovery.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/query_plan_test.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/config.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/partition.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/command.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+pkg/cmd/partition_query_loader/observations.go
+  s_beda43da85456a::t_68289fdaa862cc 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "da206c55858e7c8ae4baf8f8448a2b0c3caec4ab",
+  "prompts": {},
+  "sessions": {
+    "s_beda43da85456a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb73-8e36-7243-954e-a6fae007a8c8",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
