@@ -55,6 +55,7 @@ func getFileNameWithoutExt(path string) string {
 	return base[:len(base)-len(ext)]
 }
 
+// WalkAndParseConfigWithMaxFileCount parses up to tablePickCount YAML files under path.
 func WalkAndParseConfigWithMaxFileCount(path string, tablePickCount uint64) ([]FileConfig, error) {
 	var fileConfigs []FileConfig
 

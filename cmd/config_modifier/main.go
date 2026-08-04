@@ -8,7 +8,7 @@ import (
 
 func main() {
 
-	var rootCmd = config_modifier.NewCommand()
+	var rootCmd = configmodifier.NewCommand()
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Error: %v", err)

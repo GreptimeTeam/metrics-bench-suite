@@ -1,4 +1,4 @@
-package sample_loader
+package sampleloader
 
 import (
 	"encoding/base64"
@@ -313,6 +313,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(fileConfigs []sampl
 	}
 }
 
+// NewCommand creates the sample loader command.
 func NewCommand() *cobra.Command {
 	sampleLoader := &SampleLoader{}
 

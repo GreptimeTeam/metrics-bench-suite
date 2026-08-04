@@ -21,14 +21,14 @@ func main() {
 		},
 	}
 
-	var sampleLoaderCmd = sample_loader.NewCommand()
-	var sampleGeneratorCmd = sample_generator.NewCommand()
-	var configModifierCmd = config_modifier.NewCommand()
-	var remoteWriteRequestViewerCmd = remote_write_request_viewer.NewCommand()
+	var sampleLoaderCmd = sampleloader.NewCommand()
+	var sampleGeneratorCmd = samplegenerator.NewCommand()
+	var configModifierCmd = configmodifier.NewCommand()
+	var remoteWriteRequestViewerCmd = remotewriterequestviewer.NewCommand()
 	var loaderCmd = loader.NewCommand()
-	var schemaGeneratorCmd = schema_generator.NewCommand()
-	var tableCreatorCmd = table_creator.NewCommand()
-	var timeseriesAnalyzerCmd = timeseries_analyzer.NewCommand()
+	var schemaGeneratorCmd = schemagenerator.NewCommand()
+	var tableCreatorCmd = tablecreator.NewCommand()
+	var timeseriesAnalyzerCmd = timeseriesanalyzer.NewCommand()
 	rootCmd.AddCommand(configModifierCmd)
 	rootCmd.AddCommand(sampleLoaderCmd)
 	rootCmd.AddCommand(sampleGeneratorCmd)

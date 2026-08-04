@@ -103,6 +103,7 @@ type ConstantString struct {
 	value string
 }
 
+// NumCandidates returns the number of values the distribution can produce.
 func (c *ConstantString) NumCandidates() int {
 	return 1
 }
@@ -217,6 +218,7 @@ type WeightedPreset struct {
 	totalWeight int
 }
 
+// NumCandidates returns the number of values the distribution can produce.
 func (w *WeightedPreset) NumCandidates() int {
 	return len(w.preset)
 }

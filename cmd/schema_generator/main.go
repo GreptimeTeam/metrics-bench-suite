@@ -6,7 +6,7 @@ import (
 )
 
 func main() {
-	var rootCmd = schema_generator.NewCommand()
+	var rootCmd = schemagenerator.NewCommand()
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Error: %v", err)
 	}

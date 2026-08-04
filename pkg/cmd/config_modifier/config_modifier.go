@@ -1,4 +1,4 @@
-package config_modifier
+package configmodifier
 
 import (
 	"bufio"
@@ -286,6 +286,7 @@ func (c *ConfigModifier) run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// NewCommand creates the config modifier command.
 func NewCommand() *cobra.Command {
 	configModifier := &ConfigModifier{}
 

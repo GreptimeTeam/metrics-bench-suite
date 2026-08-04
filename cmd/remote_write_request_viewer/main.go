@@ -8,7 +8,7 @@ import (
 
 func main() {
 
-	var rootCmd = remote_write_request_viewer.NewCommand()
+	var rootCmd = remotewriterequestviewer.NewCommand()
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)

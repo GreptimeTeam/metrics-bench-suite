@@ -245,6 +245,7 @@ func (l *Loader) getAllRemoteWriteRequest() ([]prompb.WriteRequest, error) {
 	return wrSet, nil
 }
 
+// NewCommand creates the loader command.
 func NewCommand() *cobra.Command {
 	loader := &Loader{}
 

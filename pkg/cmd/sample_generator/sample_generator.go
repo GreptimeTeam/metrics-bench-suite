@@ -1,4 +1,4 @@
-package sample_generator
+package samplegenerator
 
 import (
 	"fmt"
@@ -238,6 +238,7 @@ func (s *SampleGenerator) fileName() string {
 	return fmt.Sprintf("%s.%s-[%s-%s].%s", s.Database, s.Table, startDate, endDate, "parquet")
 }
 
+// NewCommand creates the sample generator command.
 func NewCommand() *cobra.Command {
 	sampleGenerator := &SampleGenerator{}
 

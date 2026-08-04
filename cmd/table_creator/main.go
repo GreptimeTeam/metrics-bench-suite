@@ -8,7 +8,7 @@ import (
 
 func main() {
 
-	var rootCmd = table_creator.NewCommand()
+	var rootCmd = tablecreator.NewCommand()
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Error: %v", err)
 	}

@@ -1,4 +1,4 @@
-package remote_write_request_viewer
+package remotewriterequestviewer
 
 import (
 	"encoding/base64"
@@ -76,6 +76,7 @@ func parseInputType(input string) (InputType, error) {
 	}
 }
 
+// NewCommand creates the remote write request viewer command.
 func NewCommand() *cobra.Command {
 	viewer := &Viewer{}
 

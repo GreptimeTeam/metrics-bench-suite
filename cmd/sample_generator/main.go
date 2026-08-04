@@ -8,7 +8,7 @@ import (
 
 func main() {
 
-	var rootCmd = sample_generator.NewCommand()
+	var rootCmd = samplegenerator.NewCommand()
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Error: %v", err)
