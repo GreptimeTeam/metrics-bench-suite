@@ -170,6 +170,7 @@ type SampleLoader struct {
 	ChurnRate float64
 	// ChurnInterval is the duration between churn events.
 	ChurnInterval time.Duration
+	LoadProfile   string
 }
 
 func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
@@ -276,6 +277,13 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	s.LoadProfile, err = cmd.Flags().GetString("load-profile")
+	if err != nil {
+		return err
+	}
+	if s.LoadProfile != "continuous" && s.LoadProfile != "periodic-burst" {
+		return fmt.Errorf("load-profile must be continuous or periodic-burst")
+	}
 	log.Printf("Start date: %s", s.StartDate)
 	log.Printf("End date: %s", s.EndDate)
 	log.Printf("Interval: %s", s.Interval)
@@ -297,8 +305,10 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if len(fileConfigs) == 0 {
 		return fmt.Errorf("no config files found")
 	}
-
 	samples.AssignChurnIndices(fileConfigs, s.ChurnRate)
+	if s.LoadProfile == "periodic-burst" {
+		return s.runPeriodic(cmd, fileConfigs)
+	}
 
 	log.Printf("Generating metrics...")
 
@@ -595,6 +605,24 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")
 	rootCmd.Flags().Float64("churn-rate", 0.0, "The rate of time series to churn (0.0-1.0, e.g., 0.01 = 1%)")
 	rootCmd.Flags().String("churn-interval", "0s", "The interval at which churn occurs (e.g., 10m)")
+	rootCmd.Flags().String("load-profile", "continuous", "Load profile: continuous or periodic-burst")
+	rootCmd.Flags().String("baseline-duration", defaultBaselineDuration.String(), "Observation-only duration before periodic bursts")
+	rootCmd.Flags().String("burst-active-duration", defaultBurstActive.String(), "Sustained remote-write duration in each burst")
+	rootCmd.Flags().String("burst-period", defaultBurstPeriod.String(), "Total duration of each periodic burst")
+	rootCmd.Flags().Uint64("burst-count", 0, "Number of periodic bursts; zero runs indefinitely")
+	rootCmd.Flags().String("observe-interval", defaultObserveInterval.String(), "Region statistics observation interval")
+	rootCmd.Flags().String("observe-sql-url", "", "HTTP SQL endpoint; defaults to the remote-write endpoint origin")
+	rootCmd.Flags().String("target-database", "public", "Database containing the target physical table")
+	rootCmd.Flags().String("target-physical-table", "", "Physical table to observe in periodic-burst mode")
+	rootCmd.Flags().String("target-logical-table", "", "Logical table represented by the periodic-burst workload")
+	rootCmd.Flags().String("autopilot-expect", "", "Expected Enterprise automation: repartition, rebalance, or both")
+	rootCmd.Flags().Float64("pressure-high-min-write-bps", 0, "Minimum sustained payload bytes per second considered high pressure")
+	rootCmd.Flags().String("monitoring-url", "", "GreptimeDB HTTP endpoint used to ingest benchmark events")
+	rootCmd.Flags().String("monitoring-db", "public", "Database for benchmark event records")
+	rootCmd.Flags().String("monitoring-table", "benchmark_autopilot_events", "Table for benchmark event records")
+	rootCmd.Flags().String("monitoring-username", "", "Username for monitoring HTTP Basic authorization")
+	rootCmd.Flags().String("monitoring-password", "", "Password for monitoring HTTP Basic authorization")
+	rootCmd.Flags().String("autopilot-config-file", "", "Path to the effective Enterprise autopilot configuration snapshot")
 
 	return rootCmd
 }
