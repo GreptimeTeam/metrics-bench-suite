@@ -1,0 +1,85 @@
+PARTITION_QUERY_LOADER_DESIGN.md
+  s_55057c339fd7db::t_0682ae61d8bf0d 115,118
+  s_7c602aaea7d68b::t_267ef5b749c768 1-33,37-39,43-68,70-78,80,82,85-114,116-117,119-125,127-138,141,143-158
+  s_55057c339fd7db::t_2962d40604b86e 79,81,83
+  s_55057c339fd7db::t_d091c14c82ed6c 126
+  s_55057c339fd7db::t_4c23a6016e49eb 34-36,40-42,140,142
+  s_55057c339fd7db::t_6fbe091332bb96 69
+  s_0b3e808051c755::t_9dd172889cfba4 84
+  s_55057c339fd7db::t_a4e047ae8b84e4 139
+cmd/partition_query_loader/README.md
+  s_55057c339fd7db::t_d091c14c82ed6c 23,28
+  s_55057c339fd7db::t_4c23a6016e49eb 21,29
+  s_55057c339fd7db::t_a4e047ae8b84e4 15
+  s_55057c339fd7db::t_6fbe091332bb96 22
+  s_55057c339fd7db::t_a11e63be7f1633 24,26-27
+  s_80ddda886a124d::t_abb06e2b4e56c1 1-14,16-20,25,30-61
+cmd/partition_query_loader/main.go
+  s_1739a91ccdcdcf::t_cea3c8af866d1f 1-13
+pkg/cmd/partition_query_loader/discovery_test.go
+  s_55057c339fd7db::t_5b4d1a8030b25c 1-158
+pkg/cmd/partition_query_loader/observations.go
+  s_55057c339fd7db::t_36ee2486f5091e 1-179
+pkg/cmd/partition_query_loader/partition_test.go
+  s_0a2a7453cd9b89::t_32b5839fd40c8a 1-127
+pkg/cmd/partition_query_loader/query_plan.go
+  s_0b3e808051c755::t_d14eec964c85f5 1-108
+pkg/cmd/partition_query_loader/workload.go
+  s_55057c339fd7db::t_78316de5957043 1-443
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "7c3b7633fd6629f225886aaeb72ffc995913583b",
+  "prompts": {},
+  "sessions": {
+    "s_0a2a7453cd9b89": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0a4b3bf5affefLe6qdfOY3KgHj",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    },
+    "s_0b3e808051c755": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0a48bebb8ffeGu398iAeFLvaqk",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    },
+    "s_1739a91ccdcdcf": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0a68ab1fdffe2EumGR4RfuYt14",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    },
+    "s_55057c339fd7db": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0a49b5dfcffeYNbjxQJCZhqzeB",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    },
+    "s_7c602aaea7d68b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0b4bcd34cffeWNXpq1L9wquuJo",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    },
+    "s_80ddda886a124d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0a4c342d6ffeiwTNQHX6uk6PSH",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
