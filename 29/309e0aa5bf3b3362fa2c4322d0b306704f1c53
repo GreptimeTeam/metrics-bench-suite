@@ -1,0 +1,20 @@
+.github/workflows/docker.yaml
+  s_ac38befe5e3e47::t_c41ec0f4a34ca3 3-7,41,48,53
+  s_ac38befe5e3e47::t_aba1840e248d79 29-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "29309e0aa5bf3b3362fa2c4322d0b306704f1c53",
+  "prompts": {},
+  "sessions": {
+    "s_ac38befe5e3e47": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb7f-529c-7702-9e11-bcc0c878a064",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
