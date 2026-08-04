@@ -1,0 +1,21 @@
+cmd/partition_query_loader/README.md
+  s_beda43da85456a::t_19d8a69ba4e0cc 1-55
+  s_beda43da85456a::t_348893fde02bb6 56-58
+  s_beda43da85456a::t_e0093375179e6f 59-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "04efb748c04f5f37b904c0b5e38f970c4ac74ab1",
+  "prompts": {},
+  "sessions": {
+    "s_beda43da85456a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb73-8e36-7243-954e-a6fae007a8c8",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
