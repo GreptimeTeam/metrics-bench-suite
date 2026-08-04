@@ -1,4 +1,4 @@
-package partition_query_loader
+package partitionqueryloader
 
 // DiscoveredTable is a logical metric table that can safely receive bounded reads.
 type DiscoveredTable struct {

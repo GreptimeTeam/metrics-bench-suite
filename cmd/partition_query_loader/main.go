@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"metrics-bench-suite/pkg/cmd/partition_query_loader"
+	partition_query_loader "metrics-bench-suite/pkg/cmd/partition_query_loader"
 )
 
 func main() {

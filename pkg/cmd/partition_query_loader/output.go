@@ -1,4 +1,4 @@
-package partition_query_loader
+package partitionqueryloader
 
 import (
 	"encoding/csv"
