@@ -6,7 +6,7 @@ import (
 )
 
 func main() {
-	var rootCmd = sample_loader.NewCommand()
+	var rootCmd = sampleloader.NewCommand()
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Error: %v", err)
 	}

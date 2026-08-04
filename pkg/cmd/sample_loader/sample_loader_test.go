@@ -1,4 +1,4 @@
-package sample_loader
+package sampleloader
 
 import (
 	"metrics-bench-suite/pkg/samples"
@@ -276,10 +276,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 			}
 
 			// Check 2: Other labels (excluding __name__) are sorted lexicographically
-			labelsAfterName := make([]prompb.Label, 0)
-			for _, label := range ts.Labels[1:] { // Skip the first __name__ label
-				labelsAfterName = append(labelsAfterName, label)
-			}
+			labelsAfterName := ts.Labels[1:] // Skip the first __name__ label
 
 			// Verify labels are sorted lexicographically (excluding __name__)
 			for i := 0; i < len(labelsAfterName)-1; i++ {

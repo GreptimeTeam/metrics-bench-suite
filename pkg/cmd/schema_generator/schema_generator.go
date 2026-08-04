@@ -1,4 +1,4 @@
-package schema_generator
+package schemagenerator
 
 import (
 	"database/sql"
@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	// Register the MySQL driver for database/sql.
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"golang.org/x/exp/maps"
@@ -109,6 +110,7 @@ func generateSampleLoaderYaml(replica int, tableInfos *[]map[string]any, targetF
 	return nil
 }
 
+// SchemaGenerator generates physical and logical metric table schemas.
 type SchemaGenerator struct {
 	mysqlHost          string
 	mysqlPort          string
@@ -152,7 +154,7 @@ func (schema_generator *SchemaGenerator) generateMetricsSQL(physicalTables []str
 	sqlTemplate := "CREATE TABLE IF NOT EXISTS `%s` (\n`greptime_timestamp` TIMESTAMP(3) NOT NULL,\n`greptime_value` DOUBLE NULL,\n`region` STRING NULL,\n%s,\nTIME INDEX (greptime_timestamp),\nPRIMARY KEY (`region`,%s),\n) ENGINE = metric WITH (\non_physical_table = '%s'\n);"
 
 	var tableInfoList []map[string]any = make([]map[string]any, 0)
-	var finalSqlMap = make(map[string]string)
+	var finalSQLMap = make(map[string]string)
 	currentTableID := 0
 
 	for _, physicalTable := range physicalTables {
@@ -171,11 +173,11 @@ func (schema_generator *SchemaGenerator) generateMetricsSQL(physicalTables []str
 			}
 			tableInfoList = append(tableInfoList, tableInfo)
 			sqlStr := fmt.Sprintf(sqlTemplate, tableName, strings.Join(columnsStr, ",\n"), strings.Join(primaryKeys, ","), physicalTable)
-			finalSqlMap[tableName] = sqlStr
+			finalSQLMap[tableName] = sqlStr
 			currentTableID++
 		}
 	}
-	return tableInfoList, finalSqlMap
+	return tableInfoList, finalSQLMap
 }
 
 func (schema_generator *SchemaGenerator) run() error {
@@ -184,20 +186,20 @@ func (schema_generator *SchemaGenerator) run() error {
 	metricsTableSQLFileName := fmt.Sprintf("%s/metrics_table.sql", schema_generator.targetPath)
 
 	// Generate SQL for creating a physical table
-	physicalTableSqlMap := schema_generator.generatePhysicalTableSQL()
-	physicalTableNameList := maps.Keys(physicalTableSqlMap)
+	physicalTableSQLMap := schema_generator.generatePhysicalTableSQL()
+	physicalTableNameList := maps.Keys(physicalTableSQLMap)
 	// physicalTableNameList, physicalTableSQL := schema_generator.generatePhysicalTableSQL()
-	var physicalTableSql = strings.Join(maps.Values(physicalTableSqlMap), "\n")
-	err := writeToFile(physicalTableSQLFileName, physicalTableSql) // Write only the first table SQL for now
+	var physicalTableSQL = strings.Join(maps.Values(physicalTableSQLMap), "\n")
+	err := writeToFile(physicalTableSQLFileName, physicalTableSQL) // Write only the first table SQL for now
 	if err != nil {
 		log.Printf("Error writing physical table SQL: %v\n", err)
 		return err
 	}
 
 	// Generate SQL for creating a metrics table
-	tableInfos, metricsTableSqlMap := schema_generator.generateMetricsSQL(physicalTableNameList)
-	var metricsTableSql = strings.Join(maps.Values(metricsTableSqlMap), "\n")
-	err = writeToFile(metricsTableSQLFileName, metricsTableSql)
+	tableInfos, metricsTableSQLMap := schema_generator.generateMetricsSQL(physicalTableNameList)
+	var metricsTableSQL = strings.Join(maps.Values(metricsTableSQLMap), "\n")
+	err = writeToFile(metricsTableSQLFileName, metricsTableSQL)
 	if err != nil {
 		log.Printf("Error writing metrics table SQL: %v\n", err)
 		return err
@@ -222,8 +224,8 @@ func (schema_generator *SchemaGenerator) run() error {
 		log.Printf("Error generating sample loader YAML: %v\n", err)
 		return err
 	}
-	schema_generator.doExecSQLConcurrently(maps.Values(physicalTableSqlMap), schema_generator.doExecSQLJobCount)
-	schema_generator.doExecSQLConcurrently(maps.Values(metricsTableSqlMap), schema_generator.doExecSQLJobCount)
+	schema_generator.doExecSQLConcurrently(maps.Values(physicalTableSQLMap), schema_generator.doExecSQLJobCount)
+	schema_generator.doExecSQLConcurrently(maps.Values(metricsTableSQLMap), schema_generator.doExecSQLJobCount)
 	return nil
 }
 
@@ -286,6 +288,7 @@ func (schema_generator *SchemaGenerator) doExecSQLConcurrently(sqls []string, jo
 	log.Println("All SQL execution tasks completed.")
 }
 
+// NewCommand creates the schema generator command.
 func NewCommand() *cobra.Command {
 	var rootCmd = &cobra.Command{
 		Use:   "schema_generator",

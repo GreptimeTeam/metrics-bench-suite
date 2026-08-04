@@ -2,6 +2,7 @@ package samples
 
 import "time"
 
+// ChurnEpochGenerator produces monotonically increasing epochs at a fixed interval.
 type ChurnEpochGenerator struct {
 	startTime time.Time
 	interval  time.Duration
@@ -16,6 +17,7 @@ func NewChurnEpochGenerator(interval time.Duration) *ChurnEpochGenerator {
 	}
 }
 
+// GetChurnEpoch returns the number of elapsed churn intervals.
 func (g *ChurnEpochGenerator) GetChurnEpoch() int64 {
 	if g.interval == 0 {
 		return 0

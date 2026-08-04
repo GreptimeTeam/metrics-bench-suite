@@ -1,4 +1,4 @@
-package timeseries_analyzer
+package timeseriesanalyzer
 
 import (
 	"log"
@@ -51,6 +51,7 @@ func (a *Analyzer) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// NewCommand creates the time series analyzer command.
 func NewCommand() *cobra.Command {
 	analyzer := &Analyzer{}
 

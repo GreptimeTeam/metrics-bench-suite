@@ -1,4 +1,4 @@
-package table_creator
+package tablecreator
 
 import (
 	"fmt"
@@ -132,6 +132,7 @@ func (t *TableCreator) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// NewCommand creates the table creator command.
 func NewCommand() *cobra.Command {
 	tableCreator := &TableCreator{}
 
