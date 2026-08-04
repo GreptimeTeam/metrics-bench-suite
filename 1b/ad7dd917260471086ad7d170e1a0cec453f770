@@ -1,0 +1,41 @@
+pkg/cmd/sample_loader/periodic_test.go
+  s_c43176d290fd97::t_96b39a154103c1 1-17,24-45,57-66,75-155
+  s_c43176d290fd97::t_e029f19f29506e 46-56
+  s_c43176d290fd97::t_c75d95bfc94ea0 67-74
+  s_c43176d290fd97::t_4989bcdc29a30e 18-23
+pkg/http/requester_test.go
+  s_c43176d290fd97::t_36794d7bde30aa 34-56
+  s_c43176d290fd97::t_a0a78a38fb818f 57-71
+pkg/cmd/sample_loader/periodic.go
+  s_c43176d290fd97::t_ecaa75f3730bbb 486,488,497,504,542-546
+  s_c43176d290fd97::t_be6867794c9727 8
+  s_c43176d290fd97::t_102cf2f94a8d6d 422,438,647-654
+  s_c43176d290fd97::t_d2c68ffaf0916b 40-56,219-273
+  s_c43176d290fd97::t_c4c0a6db3b11ca 185-186,191
+  s_c43176d290fd97::t_ddf67eada3bd75 180-181,183-184
+  s_c43176d290fd97::t_fb79f1a62bfab2 453,489-496,498-503,505-506,551
+  s_c43176d290fd97::t_e882c9630ff824 136,175-179,182,187-190,192-194
+  s_c43176d290fd97::t_b842f1cfbd1e88 1-7,9-39,57-135,137-174,195-218,274-421,423-437,439-452,454-485,487,507-541,547-550,552-646,655-935
+pkg/http/requester.go
+  s_c43176d290fd97::t_3f7ed82b315afb 53,56,69,77,79,82
+  s_c43176d290fd97::t_e87cded9c0e961 21-25,42-47,50
+pkg/cmd/sample_loader/sample_loader.go
+  s_c43176d290fd97::t_1694d25de78929 39,143-149,170-172,356,360,362-373
+  s_c43176d290fd97::t_67323540ffe3dc 357-359,361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "1bad7dd917260471086ad7d170e1a0cec453f770",
+  "prompts": {},
+  "sessions": {
+    "s_c43176d290fd97": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb9f-8822-70f1-a730-37d4d0368ea2",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
