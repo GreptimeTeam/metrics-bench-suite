@@ -1,0 +1,65 @@
+cmd/remote_write_request_viewer/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 11
+pkg/cmd/schema_generator/schema_generator.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1,157,176,180,189-190,192-193,200-202,227-228
+  s_ac38befe5e3e47::t_758dd2de183115 15,113,291
+pkg/cmd/sample_loader/sample_loader_test.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+  s_ac38befe5e3e47::t_758dd2de183115 279
+pkg/cmd/loader/loader.go
+  s_ac38befe5e3e47::t_758dd2de183115 248
+cmd/sample_loader/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 9
+cmd/table_creator/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 11
+pkg/cmd/timeseries_analyzer/timeseries_analyzer.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+  s_ac38befe5e3e47::t_758dd2de183115 54
+pkg/samples/epoch_generator.go
+  s_ac38befe5e3e47::t_758dd2de183115 5,20
+cmd/test_tools/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 24-27,29-31
+cmd/config_modifier/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 11
+pkg/cmd/config_modifier/config_modifier.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+  s_ac38befe5e3e47::t_758dd2de183115 289
+pkg/cmd/remote_write_request_viewer/remote_write_request_viewer.go
+  s_ac38befe5e3e47::t_758dd2de183115 79
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+cmd/schema_generator/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 9
+pkg/cmd/sample_generator/sample_generator.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+  s_ac38befe5e3e47::t_758dd2de183115 241
+cmd/timeseries_analyzer/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 11
+pkg/cmd/sample_loader/sample_loader.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+  s_ac38befe5e3e47::t_758dd2de183115 316
+pkg/cmd/table_creator/table_creator.go
+  s_ac38befe5e3e47::t_758dd2de183115 135
+  s_ac38befe5e3e47::t_650c2184f4d6e6 1
+pkg/samples/parse.go
+  s_ac38befe5e3e47::t_758dd2de183115 58
+pkg/samples/distribution.go
+  s_ac38befe5e3e47::t_878f01dc0c71a4 106,221
+cmd/sample_generator/main.go
+  s_ac38befe5e3e47::t_650c2184f4d6e6 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "bf39ddadce7530c3820b07da65bdbd16fc2319d7",
+  "prompts": {},
+  "sessions": {
+    "s_ac38befe5e3e47": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb7f-529c-7702-9e11-bcc0c878a064",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
