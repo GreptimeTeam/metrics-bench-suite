@@ -10,6 +10,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	sharedpartition "metrics-bench-suite/pkg/partition"
+
+	"github.com/prometheus/prometheus/prompb"
 )
 
 func TestPeriodicOptionsRequireExplicitExpectation(t *testing.T) {
@@ -112,6 +116,71 @@ func TestEventWriterIngestsNDJSON(t *testing.T) {
 	}
 	if received.RunID != "run-1" || received.EventSequence != 1 || received.EventTSMS == 0 {
 		t.Fatalf("unexpected event: %#v", received)
+	}
+}
+
+func TestEventWriterFlushesLifecycleEventImmediately(t *testing.T) {
+	received := make(chan benchmarkEvent, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var event benchmarkEvent
+		if err := json.NewDecoder(request.Body).Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		received <- event
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	writer := newEventWriter(periodicOptions{MonitoringURL: server.URL + "/v1/ingest"})
+	if err := writer.emitAndFlush(context.Background(), benchmarkEvent{RunID: "run-1", EventType: "pressure_scheduled"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-received:
+		if event.EventType != "pressure_scheduled" || event.EventSequence != 1 {
+			t.Fatalf("unexpected event: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle event was not flushed")
+	}
+}
+
+func TestSeededBurstScheduleIsDeterministic(t *testing.T) {
+	first, firstSeed := newPeriodicRandom(42)
+	second, secondSeed := newPeriodicRandom(42)
+	if firstSeed != 42 || secondSeed != 42 {
+		t.Fatalf("unexpected seeds: %d, %d", firstSeed, secondSeed)
+	}
+	if got, want := jitterDuration(time.Hour, 0.2, first), jitterDuration(time.Hour, 0.2, second); got != want {
+		t.Fatalf("seeded jitter differs: %s != %s", got, want)
+	}
+}
+
+func TestPlannedBurstEventRecordsSeedAndSchedule(t *testing.T) {
+	scheduled := time.Unix(100, 0)
+	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024}, 42, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true)
+	if event.EventType != "pressure_scheduled" || event.Phase != "baseline" || event.Cycle != 2 || event.ScheduledTSMS != scheduled.UnixMilli() {
+		t.Fatalf("unexpected planned event: %#v", event)
+	}
+	if !strings.Contains(event.Details, `"random_seed":42`) || !strings.Contains(event.Details, `"burst_jitter":0.2`) {
+		t.Fatalf("planned event missing scheduling details: %s", event.Details)
+	}
+}
+
+func TestConfigHotTargetsUseConfiguredPartitionValues(t *testing.T) {
+	definition, err := sharedpartition.ParsePartitionDefinition("PARTITION ON COLUMNS (namespace) (namespace < 'app-1', namespace >= 'app-1')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := configHotTargets(definition, []sharedpartition.Metadata{
+		{Name: "p0", Ordinal: 1, Expression: "namespace", Description: "namespace < 'app-1'", RegionID: 42},
+		{Name: "p1", Ordinal: 2, Expression: "namespace", Description: "namespace >= 'app-1'", RegionID: 43},
+	}, []sharedpartition.ConfigTable{{LabelValues: map[string][]string{"namespace": {"app-0", "app-1"}}}})
+	if len(targets) != 2 || targets[0].regionID != 42 || targets[1].regionID != 43 {
+		t.Fatalf("unexpected hot targets: %#v", targets)
+	}
+	if !matchesHotTarget(prompb.TimeSeries{Labels: []prompb.Label{{Name: "namespace", Value: "app-1"}}}, targets[1]) {
+		t.Fatal("expected matching target label")
 	}
 }
 
