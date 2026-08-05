@@ -329,6 +329,8 @@ func parseIdentifier(text string) (string, error) {
 	text = strings.TrimSpace(text)
 	if len(text) >= 2 && text[0] == '`' && text[len(text)-1] == '`' {
 		text = text[1 : len(text)-1]
+	} else if len(text) >= 2 && text[0] == '"' && text[len(text)-1] == '"' {
+		text = strings.ReplaceAll(text[1:len(text)-1], `""`, `"`)
 	}
 	if !identifierPattern.MatchString(text) {
 		return "", fmt.Errorf("invalid identifier %q", text)
