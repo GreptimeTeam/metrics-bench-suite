@@ -30,6 +30,11 @@ type Requester struct {
 	Header http.Header
 }
 
+// SendStats describes a completed remote-write request.
+type SendStats struct {
+	PayloadBytes int
+}
+
 // NewRequester creates a new requester
 func NewRequester(url string) *Requester {
 	return &Requester{
@@ -58,6 +63,18 @@ func (r *Requester) SendContext(ctx context.Context, writeRequest prompb.WriteRe
 
 	_, err = r.send(ctx, protobufData, contentTypeV1, remoteWriteVersionV1)
 	return err
+}
+
+// SendWithStats sends a v1 remote-write request and returns the compressed payload size.
+func (r *Requester) SendWithStats(writeRequest prompb.WriteRequest) (SendStats, error) {
+	protobufData, err := writeRequest.Marshal()
+	if err != nil {
+		return SendStats{}, err
+	}
+	compressedData := snappy.Encode(nil, protobufData)
+	stats := SendStats{PayloadBytes: len(compressedData)}
+	_, err = r.sendCompressed(context.Background(), compressedData, contentTypeV1, remoteWriteVersionV1)
+	return stats, err
 }
 
 // SendV2 sends a Prometheus remote write 2.0 request.
@@ -98,8 +115,11 @@ func (r *Requester) SendV2Context(ctx context.Context, writeRequest writev2.Requ
 }
 
 func (r *Requester) send(ctx context.Context, protobufData []byte, contentType, remoteWriteVersion string) (http.Header, error) {
-	compressedData := snappy.Encode(nil, protobufData)
-	req, err := http.NewRequestWithContext(ctx, "POST", r.URL, bytes.NewBuffer(compressedData))
+	return r.sendCompressed(ctx, snappy.Encode(nil, protobufData), contentType, remoteWriteVersion)
+}
+
+func (r *Requester) sendCompressed(ctx context.Context, compressedData []byte, contentType, remoteWriteVersion string) (http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.URL, bytes.NewBuffer(compressedData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %v", err)
 	}

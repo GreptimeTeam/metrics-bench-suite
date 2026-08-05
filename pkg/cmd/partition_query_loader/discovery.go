@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	sharedpartition "metrics-bench-suite/pkg/partition"
 )
 
 var physicalTablePattern = regexp.MustCompile(`(?is)\bon_physical_table\s*=\s*'((?:''|[^'])+)'`)
@@ -169,7 +171,7 @@ func discoverTable(ctx context.Context, db *sql.DB, database, table string, cach
 		return DiscoveredTable{}, "physical table has no partition metadata"
 	}
 
-	predicates := metadataPredicates(physical.definition, metadata)
+	predicates := sharedpartition.MetadataPredicates(physical.definition, partitionMetadataForPredicates(metadata))
 	partitions := make([]DiscoveredPartition, 0, len(predicates))
 	for index, predicate := range predicates {
 		if predicate == nil {
@@ -188,76 +190,12 @@ func discoverTable(ctx context.Context, db *sql.DB, database, table string, cach
 	return DiscoveredTable{Database: database, LogicalTable: table, PhysicalTable: physicalTable, ValueColumn: valueColumn, TimeIndex: timeIndex, Partitions: partitions}, ""
 }
 
-// metadataPredicates derives predicates from authoritative PARTITIONS rows. It only
-// consults the physical DDL for rows whose description cannot be parsed directly.
-func metadataPredicates(definition PartitionDefinition, metadata []partitionMetadataRow) []*Predicate {
-	predicates := make([]*Predicate, len(metadata))
-	uniqueNames, uniqueOrdinals := metadataIdentities(metadata)
+func partitionMetadataForPredicates(metadata []partitionMetadataRow) []sharedpartition.Metadata {
+	items := make([]sharedpartition.Metadata, len(metadata))
 	for index, item := range metadata {
-		if !uniqueNames[item.name] || !uniqueOrdinals[item.ordinal] {
-			continue
-		}
-		if predicate, ok := metadataPredicate(item); ok {
-			predicates[index] = &predicate
-		}
+		items[index] = sharedpartition.Metadata{Name: item.name, Description: item.description, RegionID: item.regionID, Expression: item.expression, Ordinal: item.ordinal}
 	}
-	for index, item := range metadata {
-		if predicates[index] != nil || !uniqueNames[item.name] || !uniqueOrdinals[item.ordinal] || item.ordinal < 1 || item.ordinal > uint64(len(definition.Partitions)) {
-			continue
-		}
-		columns, err := parseColumns(item.expression)
-		if err != nil || !sameColumns(columns, definition.Columns) {
-			continue
-		}
-		predicate, err := BuildPartitionPredicate(definition.Partitions[item.ordinal-1])
-		if err == nil {
-			predicates[index] = &predicate
-		}
-	}
-	return predicates
-}
-
-func metadataIdentities(metadata []partitionMetadataRow) (map[string]bool, map[uint64]bool) {
-	nameCounts := make(map[string]int, len(metadata))
-	ordinalCounts := make(map[uint64]int, len(metadata))
-	for _, item := range metadata {
-		nameCounts[item.name]++
-		ordinalCounts[item.ordinal]++
-	}
-	names := make(map[string]bool, len(nameCounts))
-	for name, count := range nameCounts {
-		names[name] = name != "" && count == 1
-	}
-	ordinals := make(map[uint64]bool, len(ordinalCounts))
-	for ordinal, count := range ordinalCounts {
-		ordinals[ordinal] = ordinal != 0 && count == 1
-	}
-	return names, ordinals
-}
-
-func metadataPredicate(item partitionMetadataRow) (Predicate, bool) {
-	columns, err := parseColumns(item.expression)
-	if err != nil {
-		return Predicate{}, false
-	}
-	partition, err := parsePartition(item.description, columns)
-	if err != nil {
-		return Predicate{}, false
-	}
-	predicate, err := BuildPartitionPredicate(partition)
-	return predicate, err == nil
-}
-
-func sameColumns(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	return items
 }
 
 func showCreateTable(ctx context.Context, db *sql.DB, database, table string) (string, error) {

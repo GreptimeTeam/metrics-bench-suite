@@ -113,3 +113,41 @@ func TestRequesterSendV2RejectsWrittenSampleMismatch(t *testing.T) {
 		t.Fatalf("expected written sample mismatch, got %v", err)
 	}
 }
+
+func TestRequesterSendWithStatsReportsCompressedPayload(t *testing.T) {
+	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) == 0 {
+			t.Fatal("expected compressed remote-write payload")
+		}
+		w.WriteHeader(nethttp.StatusNoContent)
+	}))
+	defer server.Close()
+
+	requester := NewRequester(server.URL)
+	stats, err := requester.SendWithStats(prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{Samples: []prompb.Sample{{Timestamp: 1, Value: 2}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PayloadBytes <= 0 {
+		t.Fatalf("expected positive compressed payload size, got %d", stats.PayloadBytes)
+	}
+}
+
+func TestRequesterSendWithStatsPreservesPayloadOnHTTPFailure(t *testing.T) {
+	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		w.WriteHeader(nethttp.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	stats, err := NewRequester(server.URL).SendWithStats(prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{Samples: []prompb.Sample{{Timestamp: 1, Value: 2}}}}})
+	if err == nil {
+		t.Fatal("expected HTTP failure")
+	}
+	if stats.PayloadBytes <= 0 {
+		t.Fatalf("expected encoded payload size on failure, got %d", stats.PayloadBytes)
+	}
+}
