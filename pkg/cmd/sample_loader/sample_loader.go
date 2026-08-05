@@ -614,14 +614,9 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().String("observe-sql-url", "", "HTTP SQL endpoint; defaults to the remote-write endpoint origin")
 	rootCmd.Flags().String("target-database", "public", "Database containing the target physical table")
 	rootCmd.Flags().String("target-physical-table", "", "Physical table to observe in periodic-burst mode")
-	rootCmd.Flags().String("target-logical-table", "", "Logical table represented by the periodic-burst workload")
 	rootCmd.Flags().String("autopilot-expect", "", "Expected Enterprise automation: repartition, rebalance, or both")
 	rootCmd.Flags().Float64("pressure-high-min-write-bps", 0, "Minimum sustained payload bytes per second considered high pressure")
-	rootCmd.Flags().String("monitoring-url", "", "GreptimeDB HTTP endpoint used to ingest benchmark events")
-	rootCmd.Flags().String("monitoring-db", "public", "Database for benchmark event records")
-	rootCmd.Flags().String("monitoring-table", "benchmark_autopilot_events", "Table for benchmark event records")
-	rootCmd.Flags().String("monitoring-username", "", "Username for monitoring HTTP Basic authorization")
-	rootCmd.Flags().String("monitoring-password", "", "Password for monitoring HTTP Basic authorization")
+	rootCmd.Flags().String("self-monitoring-url", "", "GreptimeDB self-monitoring HTTP endpoint used to ingest benchmark events")
 	rootCmd.Flags().String("autopilot-config-file", "", "Path to the effective Enterprise autopilot configuration snapshot")
 
 	return rootCmd

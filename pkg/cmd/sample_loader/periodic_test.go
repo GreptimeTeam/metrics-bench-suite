@@ -38,8 +38,8 @@ func TestPeriodicOptionsRequireExplicitExpectation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.TargetLogicalTable != options.TargetPhysicalTable {
-		t.Fatalf("expected logical table fallback %q, got %q", options.TargetPhysicalTable, options.TargetLogicalTable)
+	if options.TargetPhysicalTable != "metrics_physical" {
+		t.Fatalf("unexpected target physical table: %q", options.TargetPhysicalTable)
 	}
 }
 
@@ -88,7 +88,7 @@ func TestEventWriterIngestsNDJSON(t *testing.T) {
 		if request.URL.Path != "/v1/ingest" {
 			t.Errorf("unexpected path: %s", request.URL.Path)
 		}
-		if request.URL.Query().Get("db") != "monitor" || request.URL.Query().Get("table") != "benchmark_autopilot_events" {
+		if request.URL.Query().Get("db") != "public" || request.URL.Query().Get("table") != "benchmark_autopilot_events" {
 			t.Errorf("unexpected query: %s", request.URL.RawQuery)
 		}
 		if request.Header.Get("Content-Type") != "application/x-ndjson" {
@@ -105,13 +105,53 @@ func TestEventWriterIngestsNDJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	writer := newEventWriter(periodicOptions{MonitoringURL: server.URL + "/v1/ingest", MonitoringDatabase: "monitor", MonitoringTable: "benchmark_autopilot_events"})
+	writer := newEventWriter(periodicOptions{MonitoringURL: server.URL + "/v1/ingest"})
 	writer.emit(context.Background(), benchmarkEvent{RunID: "run-1", EventType: "run_started"})
 	if err := writer.close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if received.RunID != "run-1" || received.EventSequence != 1 || received.EventTSMS == 0 {
 		t.Fatalf("unexpected event: %#v", received)
+	}
+}
+
+func TestEventWriterBindsWorkloadEventToRegionSnapshot(t *testing.T) {
+	var received []benchmarkEvent
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		decoder := json.NewDecoder(request.Body)
+		for {
+			var event benchmarkEvent
+			if err := decoder.Decode(&event); err != nil {
+				if err == io.EOF {
+					break
+				}
+				t.Fatal(err)
+			}
+			received = append(received, event)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	bundle := &regionSnapshotBundle{
+		id:             "snapshot-1",
+		timestamp:      time.Unix(10, 0),
+		mappingVersion: 2,
+		events:         []benchmarkEvent{regionEvent(benchmarkEvent{RunID: "run-1"}, regionSnapshot{timestamp: time.Unix(10, 0), regionID: 42, partition: "p0"}, false, regionSnapshot{})},
+	}
+	writer := newEventWriter(periodicOptions{MonitoringURL: server.URL + "/v1/ingest"})
+	writer.emitWithSnapshot(context.Background(), benchmarkEvent{RunID: "run-1", EventType: "workload_window"}, bundle)
+	if err := writer.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(received) != 2 || received[0].EventType != "workload_window" || received[1].EventType != "region_stats_snapshot" {
+		t.Fatalf("unexpected snapshot bundle: %#v", received)
+	}
+	for _, event := range received {
+		var details map[string]any
+		if err := json.Unmarshal([]byte(event.Details), &details); err != nil || details["snapshot_id"] != "snapshot-1" || details["mapping_version"] != float64(2) {
+			t.Fatalf("event is not bound to snapshot: %#v, %v", event, err)
+		}
 	}
 }
 
@@ -131,7 +171,7 @@ func TestHTTPClientUsesFormSQLAndDatabase(t *testing.T) {
 		if !strings.Contains(form.Get("sql"), "information_schema.partitions") {
 			t.Fatalf("unexpected SQL: %s", form.Get("sql"))
 		}
-		_, _ = writer.Write([]byte(`{"output":[{"records":{"schema":{"column_schemas":[{"name":"partition_name"},{"name":"greptime_partition_id"},{"name":"peer_id"},{"name":"table_id"},{"name":"region_number"},{"name":"region_rows"},{"name":"written_bytes_since_open"},{"name":"query_cpu_time_millis"},{"name":"query_scanned_bytes"},{"name":"disk_size"},{"name":"memtable_size"},{"name":"manifest_size"},{"name":"sst_size"},{"name":"sst_num"},{"name":"index_size"},{"name":"engine"},{"name":"region_role"}]},"rows":[["p0",42,"node-a",1,0,10,20,30,40,50,60,70,80,2,90,"mito","Leader"]]}}]}`))
+		_, _ = writer.Write([]byte(`{"output":[{"records":{"schema":{"column_schemas":[{"name":"partition_name"},{"name":"partition_expression"},{"name":"partition_description"},{"name":"greptime_partition_id"},{"name":"peer_id"},{"name":"table_id"},{"name":"region_number"},{"name":"region_rows"},{"name":"written_bytes_since_open"},{"name":"query_cpu_time_millis"},{"name":"query_scanned_bytes"},{"name":"disk_size"},{"name":"memtable_size"},{"name":"manifest_size"},{"name":"sst_size"},{"name":"sst_num"},{"name":"index_size"},{"name":"engine"},{"name":"region_role"}]},"rows":[["p0","namespace","namespace < 'app-1'",42,"node-a",1,0,10,20,30,40,50,60,70,80,2,90,"mito","Leader"]]}}]}`))
 	}))
 	defer server.Close()
 

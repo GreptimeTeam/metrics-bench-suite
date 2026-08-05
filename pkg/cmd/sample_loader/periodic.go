@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,6 +21,7 @@ import (
 	"time"
 
 	benchhttp "metrics-bench-suite/pkg/http"
+	sharedpartition "metrics-bench-suite/pkg/partition"
 	"metrics-bench-suite/pkg/samples"
 
 	"github.com/prometheus/prometheus/prompb"
@@ -45,12 +45,9 @@ type periodicOptions struct {
 	ObserveSQLURL           string
 	TargetDatabase          string
 	TargetPhysicalTable     string
-	TargetLogicalTable      string
 	AutopilotExpect         string
 	PressureHighMinWriteBPS float64
 	MonitoringURL           string
-	MonitoringDatabase      string
-	MonitoringTable         string
 	MonitoringAuthorization string
 	AutopilotConfigSnapshot string
 	AutopilotConfigHash     string
@@ -91,39 +88,16 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	if options.TargetPhysicalTable, err = cmd.Flags().GetString("target-physical-table"); err != nil {
 		return periodicOptions{}, err
 	}
-	if options.TargetLogicalTable, err = cmd.Flags().GetString("target-logical-table"); err != nil {
-		return periodicOptions{}, err
-	}
 	if options.AutopilotExpect, err = cmd.Flags().GetString("autopilot-expect"); err != nil {
 		return periodicOptions{}, err
 	}
 	if options.PressureHighMinWriteBPS, err = cmd.Flags().GetFloat64("pressure-high-min-write-bps"); err != nil {
 		return periodicOptions{}, err
 	}
-	if options.MonitoringURL, err = cmd.Flags().GetString("monitoring-url"); err != nil {
+	if options.MonitoringURL, err = cmd.Flags().GetString("self-monitoring-url"); err != nil {
 		return periodicOptions{}, err
-	}
-	if options.MonitoringDatabase, err = cmd.Flags().GetString("monitoring-db"); err != nil {
-		return periodicOptions{}, err
-	}
-	if options.MonitoringTable, err = cmd.Flags().GetString("monitoring-table"); err != nil {
-		return periodicOptions{}, err
-	}
-	monitoringUser, err := cmd.Flags().GetString("monitoring-username")
-	if err != nil {
-		return periodicOptions{}, err
-	}
-	monitoringPassword, err := cmd.Flags().GetString("monitoring-password")
-	if err != nil {
-		return periodicOptions{}, err
-	}
-	if (monitoringUser == "") != (monitoringPassword == "") {
-		return periodicOptions{}, fmt.Errorf("monitoring-username and monitoring-password must be provided together")
 	}
 	options.MonitoringAuthorization = loader.authorizationHeader()
-	if monitoringUser != "" {
-		options.MonitoringAuthorization = basicAuthorization(monitoringUser, monitoringPassword)
-	}
 	configFile, err := cmd.Flags().GetString("autopilot-config-file")
 	if err != nil {
 		return periodicOptions{}, err
@@ -147,9 +121,6 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	if options.TargetDatabase == "" || options.TargetPhysicalTable == "" {
 		return periodicOptions{}, fmt.Errorf("target-database and target-physical-table are required in periodic-burst mode")
 	}
-	if options.TargetLogicalTable == "" {
-		options.TargetLogicalTable = options.TargetPhysicalTable
-	}
 	if !cmd.Flags().Changed("autopilot-expect") || (options.AutopilotExpect != "repartition" && options.AutopilotExpect != "rebalance" && options.AutopilotExpect != "both") {
 		return periodicOptions{}, fmt.Errorf("autopilot-expect must be explicitly set to repartition, rebalance, or both in periodic-burst mode")
 	}
@@ -160,7 +131,7 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 		return options, nil
 	}
 	if options.MonitoringURL == "" {
-		return periodicOptions{}, fmt.Errorf("monitoring-url is required when periodic-burst mode is not dry-run")
+		return periodicOptions{}, fmt.Errorf("self-monitoring-url is required when periodic-burst mode is not dry-run")
 	}
 	if options.ObserveSQLURL == "" {
 		options.ObserveSQLURL, err = replaceEndpointPath(loader.RemoteWriteURL, "/v1/sql")
@@ -194,14 +165,6 @@ func redactConfigSnapshot(snapshot string) string {
 	return strings.Join(lines, "\n")
 }
 
-func basicAuthorization(username, password string) string {
-	return "Basic " + base64Encode(username+":"+password)
-}
-
-func base64Encode(value string) string {
-	return base64.StdEncoding.EncodeToString([]byte(value))
-}
-
 func replaceEndpointPath(value, path string) (string, error) {
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -229,6 +192,8 @@ type benchmarkEvent struct {
 	RegionID                  uint64  `json:"region_id"`
 	RegionNumber              uint64  `json:"region_number"`
 	Partition                 string  `json:"partition"`
+	PartitionDescription      string  `json:"partition_description"`
+	PartitionExpression       string  `json:"partition_expression"`
 	LeaderDatanode            string  `json:"leader_datanode"`
 	RegionRole                string  `json:"region_role"`
 	Engine                    string  `json:"engine"`
@@ -276,8 +241,6 @@ type benchmarkEvent struct {
 type eventWriter struct {
 	client        *http.Client
 	endpoint      string
-	database      string
-	table         string
 	authorization string
 	mu            sync.Mutex
 	sequence      uint64
@@ -286,21 +249,41 @@ type eventWriter struct {
 }
 
 func newEventWriter(options periodicOptions) *eventWriter {
-	return &eventWriter{client: &http.Client{Timeout: 30 * time.Second}, endpoint: options.MonitoringURL, database: options.MonitoringDatabase, table: options.MonitoringTable, authorization: options.MonitoringAuthorization}
+	return &eventWriter{client: &http.Client{Timeout: 30 * time.Second}, endpoint: options.MonitoringURL, authorization: options.MonitoringAuthorization}
 }
 
 func (w *eventWriter) emit(ctx context.Context, event benchmarkEvent) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.appendLocked(event)
+	if len(w.pending) >= 100 {
+		w.flushLocked(ctx)
+	}
+}
+
+func (w *eventWriter) emitWithSnapshot(ctx context.Context, event benchmarkEvent, bundle *regionSnapshotBundle) {
+	if bundle == nil {
+		w.emit(ctx, event)
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.appendLocked(withSnapshotDetails(event, bundle))
+	for _, snapshotEvent := range bundle.events {
+		w.appendLocked(withSnapshotDetails(snapshotEvent, bundle))
+	}
+	if len(w.pending) >= 100 {
+		w.flushLocked(ctx)
+	}
+}
+
+func (w *eventWriter) appendLocked(event benchmarkEvent) {
 	w.sequence++
 	event.EventSequence = w.sequence
 	if event.EventTSMS == 0 {
 		event.EventTSMS = time.Now().UnixMilli()
 	}
 	w.pending = append(w.pending, event)
-	if len(w.pending) >= 100 {
-		w.flushLocked(ctx)
-	}
 }
 
 func (w *eventWriter) close(ctx context.Context) error {
@@ -330,8 +313,8 @@ func (w *eventWriter) flushLocked(ctx context.Context) {
 		return
 	}
 	query := endpoint.Query()
-	query.Set("db", w.database)
-	query.Set("table", w.table)
+	query.Set("db", "public")
+	query.Set("table", "benchmark_autopilot_events")
 	query.Set("pipeline_name", "greptime_identity")
 	query.Set("custom_time_index", "event_ts_ms;epoch;ms")
 	endpoint.RawQuery = query.Encode()
@@ -383,7 +366,7 @@ type writeResult struct {
 	err          error
 }
 
-func periodicWorker(url, authorization string, requests <-chan prompb.WriteRequest, results chan<- writeResult, wg *sync.WaitGroup, dryRun bool) {
+func periodicWorker(url, authorization, physicalTable string, requests <-chan prompb.WriteRequest, results chan<- writeResult, wg *sync.WaitGroup, dryRun bool) {
 	defer wg.Done()
 	for request := range requests {
 		result := writeResult{requestCount: 1, sampleCount: sampleCount(request)}
@@ -395,6 +378,7 @@ func periodicWorker(url, authorization string, requests <-chan prompb.WriteReque
 			if authorization != "" {
 				requester.SetHeader("Authorization", authorization)
 			}
+			requester.SetHeader("x-greptime-hint-physical_table", physicalTable)
 			stats, err := requester.SendWithStats(request)
 			result.payloadBytes = uint64(stats.PayloadBytes)
 			result.err = err
@@ -464,23 +448,41 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 		ctx = context.Background()
 	}
 	runID := newRunID()
-	baseEvent := benchmarkEvent{RunID: runID, TargetDatabase: options.TargetDatabase, LogicalTable: options.TargetLogicalTable, PhysicalTable: options.TargetPhysicalTable, AutopilotExpect: options.AutopilotExpect, AutopilotConfigHash: options.AutopilotConfigHash, AutopilotConfigSnapshot: options.AutopilotConfigSnapshot, AnalysisContextIncomplete: options.AutopilotConfigSnapshot == ""}
+	configTables, logicalTables := configTables(fileConfigs)
+	logicalTable := ""
+	if len(logicalTables) == 1 {
+		logicalTable = logicalTables[0]
+	}
+	baseEvent := benchmarkEvent{RunID: runID, TargetDatabase: options.TargetDatabase, LogicalTable: logicalTable, PhysicalTable: options.TargetPhysicalTable, AutopilotExpect: options.AutopilotExpect, AutopilotConfigHash: options.AutopilotConfigHash, AutopilotConfigSnapshot: options.AutopilotConfigSnapshot, AnalysisContextIncomplete: options.AutopilotConfigSnapshot == ""}
 
 	var writer *eventWriter
+	var snapshots *regionSnapshotStore
+	var refresher *regionRefresher
 	if !s.DryRun {
 		writer = newEventWriter(options)
-		writer.emit(ctx, eventWith(baseEvent, "run_started", "baseline", 0, func(event *benchmarkEvent) {
-			event.Details = fmt.Sprintf(`{"baseline_duration":"%s","burst_active_duration":"%s","burst_period":"%s","burst_count":%d,"observe_interval":"%s","pressure_high_min_write_bps":%g}`, options.BaselineDuration, options.BurstActiveDuration, options.BurstPeriod, options.BurstCount, options.ObserveInterval, options.PressureHighMinWriteBPS)
-		}))
+		snapshots = &regionSnapshotStore{}
+		client := httpSQLClient{endpoint: options.ObserveSQLURL, database: options.TargetDatabase, authorization: s.authorizationHeader(), client: &http.Client{Timeout: 30 * time.Second}}
+		refresher = &regionRefresher{client: client, physicalTable: options.TargetPhysicalTable, configTables: configTables, logicalTables: logicalTables, base: baseEvent, previous: make(map[uint64]regionSnapshot), store: snapshots}
+		bundle, changes, err := refresher.refresh(ctx)
+		if err != nil {
+			_ = writer.close(context.Background())
+			return fmt.Errorf("initial region snapshot: %w", err)
+		}
+		writer.emitWithSnapshot(ctx, eventWith(baseEvent, "run_started", "baseline", 0, func(event *benchmarkEvent) {
+			event.Details = fmt.Sprintf(`{"baseline_duration":"%s","burst_active_duration":"%s","burst_period":"%s","burst_count":%d,"observe_interval":"%s","pressure_high_min_write_bps":%g,"configured_logical_tables":%s}`, options.BaselineDuration, options.BurstActiveDuration, options.BurstPeriod, options.BurstCount, options.ObserveInterval, options.PressureHighMinWriteBPS, mustJSON(logicalTables))
+		}), bundle)
+		for _, event := range changes {
+			writer.emitWithSnapshot(ctx, event, bundle)
+		}
 	}
 
 	observerContext, cancelObserver := context.WithCancel(ctx)
 	var observerDone chan struct{}
-	if writer != nil {
+	if refresher != nil {
 		observerDone = make(chan struct{})
 		go func() {
 			defer close(observerDone)
-			s.observeRegions(observerContext, options, writer, baseEvent)
+			refresher.run(observerContext, options.ObserveInterval, writer)
 		}()
 	}
 	observerStopped := false
@@ -498,9 +500,9 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 		}
 		finishContext := context.Background()
 		if runErr != nil {
-			writer.emit(finishContext, eventWith(baseEvent, "run_failed", "failed", 0, func(event *benchmarkEvent) {
+			emitWithCurrentSnapshot(writer, finishContext, eventWith(baseEvent, "run_failed", "failed", 0, func(event *benchmarkEvent) {
 				event.Error = runErr.Error()
-			}))
+			}), snapshots)
 		}
 		if closeErr := writer.close(finishContext); runErr == nil && closeErr != nil {
 			runErr = fmt.Errorf("flush benchmark events: %w", closeErr)
@@ -515,27 +517,27 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	churnEpochGenerator := samples.NewChurnEpochGenerator(s.ChurnInterval)
 	for cycle := uint64(1); options.BurstCount == 0 || cycle <= options.BurstCount; cycle++ {
 		if writer != nil {
-			writer.emit(ctx, eventWith(baseEvent, "pressure_started", "active", cycle, func(event *benchmarkEvent) {
+			emitWithCurrentSnapshot(writer, ctx, eventWith(baseEvent, "pressure_started", "active", cycle, func(event *benchmarkEvent) {
 				now := time.Now()
 				event.ScheduledTSMS = now.UnixMilli()
 				event.ActualTSMS = now.UnixMilli()
 				event.PressureThresholdBPS = options.PressureHighMinWriteBPS
-			}))
+			}), snapshots)
 		}
-		if err := s.runPeriodicActive(ctx, fileConfigs, &current, churnEpochGenerator, options, writer, baseEvent, cycle); err != nil {
+		if err := s.runPeriodicActive(ctx, fileConfigs, &current, churnEpochGenerator, options, writer, snapshots, baseEvent, cycle); err != nil {
 			return err
 		}
 		cooldown := options.BurstPeriod - options.BurstActiveDuration
 		if writer != nil {
-			writer.emit(ctx, eventWith(baseEvent, "phase_completed", "active", cycle, func(event *benchmarkEvent) {
+			emitWithCurrentSnapshot(writer, ctx, eventWith(baseEvent, "phase_completed", "active", cycle, func(event *benchmarkEvent) {
 				event.Details = "active requests drained"
-			}))
+			}), snapshots)
 		}
 		if err := waitContext(ctx, cooldown); err != nil {
 			return err
 		}
 		if writer != nil {
-			writer.emit(ctx, eventWith(baseEvent, "phase_completed", "cooldown", cycle, nil))
+			emitWithCurrentSnapshot(writer, ctx, eventWith(baseEvent, "phase_completed", "cooldown", cycle, nil), snapshots)
 		}
 	}
 
@@ -547,11 +549,11 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	if writer == nil {
 		return nil
 	}
-	writer.emit(ctx, eventWith(baseEvent, "run_completed", "completed", 0, nil))
+	emitWithCurrentSnapshot(writer, ctx, eventWith(baseEvent, "run_completed", "completed", 0, nil), snapshots)
 	return nil
 }
 
-func (s *SampleLoader) runPeriodicActive(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, options periodicOptions, writer *eventWriter, base benchmarkEvent, cycle uint64) error {
+func (s *SampleLoader) runPeriodicActive(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, cycle uint64) error {
 	requests := make(chan prompb.WriteRequest, s.Workers)
 	results := make(chan writeResult, s.Workers*2)
 	collector := &workloadCollector{}
@@ -566,7 +568,7 @@ func (s *SampleLoader) runPeriodicActive(ctx context.Context, fileConfigs []samp
 	var workers sync.WaitGroup
 	for i := 0; i < s.Workers; i++ {
 		workers.Add(1)
-		go periodicWorker(s.RemoteWriteURL, s.authorizationHeader(), requests, results, &workers, s.DryRun)
+		go periodicWorker(s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, requests, results, &workers, s.DryRun)
 	}
 
 	started := time.Now()
@@ -579,7 +581,7 @@ func (s *SampleLoader) runPeriodicActive(ctx context.Context, fileConfigs []samp
 	consecutiveHigh := uint64(0)
 	generate := func() {
 		epoch := churn.GetChurnEpoch()
-		s.convertToRemoteWriteRequestsStreaming(fileConfigs, *current, requests, epoch)
+		s.convertToRemoteWriteRequestsStreaming(ctx, fileConfigs, *current, requests, epoch)
 		*current = current.Add(s.Interval)
 	}
 	generate()
@@ -595,7 +597,7 @@ func (s *SampleLoader) runPeriodicActive(ctx context.Context, fileConfigs []samp
 		case <-tick.C:
 			generate()
 		case now := <-window.C:
-			consecutiveHigh = emitWorkloadWindow(ctx, writer, base, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh)
+			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh)
 			windowStarted = now
 		}
 	}
@@ -604,11 +606,11 @@ func (s *SampleLoader) runPeriodicActive(ctx context.Context, fileConfigs []samp
 	close(results)
 	<-collectorDone
 	now := time.Now()
-	emitWorkloadWindow(ctx, writer, base, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh)
+	emitWorkloadWindow(ctx, writer, snapshots, base, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh)
 	return nil
 }
 
-func emitWorkloadWindow(ctx context.Context, writer *eventWriter, base benchmarkEvent, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64) uint64 {
+func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64) uint64 {
 	if writer == nil || !end.After(start) {
 		return consecutiveHigh
 	}
@@ -634,32 +636,48 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, base benchmark
 		consecutiveHigh++
 	} else {
 		if consecutiveHigh >= 3 {
-			writer.emit(ctx, eventWith(base, "pressure_dropped", "active", cycle, func(event *benchmarkEvent) {
+			emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_dropped", "active", cycle, func(event *benchmarkEvent) {
 				event.WriteBPS = writeBPS
 				event.PressureThresholdBPS = threshold
 				event.ConsecutiveHighWindows = consecutiveHigh
-			}))
+			}), snapshots)
 		}
 		consecutiveHigh = 0
 	}
 	event.ConsecutiveHighWindows = consecutiveHigh
-	writer.emit(ctx, event)
+	emitWithCurrentSnapshot(writer, ctx, event, snapshots)
 	if metrics.errorCount > 0 {
-		writer.emit(ctx, eventWith(base, "write_error", "active", cycle, func(event *benchmarkEvent) {
+		emitWithCurrentSnapshot(writer, ctx, eventWith(base, "write_error", "active", cycle, func(event *benchmarkEvent) {
 			event.WindowStartMS = start.UnixMilli()
 			event.WindowEndMS = end.UnixMilli()
 			event.ErrorCount = metrics.errorCount
 			event.Error = metrics.lastError
-		}))
+		}), snapshots)
 	}
 	if consecutiveHigh == 3 {
-		writer.emit(ctx, eventWith(base, "pressure_observed_high", "active", cycle, func(event *benchmarkEvent) {
+		emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_observed_high", "active", cycle, func(event *benchmarkEvent) {
 			event.WriteBPS = writeBPS
 			event.PressureThresholdBPS = threshold
 			event.ConsecutiveHighWindows = consecutiveHigh
-		}))
+		}), snapshots)
 	}
 	return consecutiveHigh
+}
+
+func emitWithCurrentSnapshot(writer *eventWriter, ctx context.Context, event benchmarkEvent, snapshots *regionSnapshotStore) {
+	if snapshots == nil {
+		writer.emit(ctx, event)
+		return
+	}
+	writer.emitWithSnapshot(ctx, event, snapshots.get())
+}
+
+func mustJSON(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "[]"
+	}
+	return string(encoded)
 }
 
 func latencyPercentileMS(values []time.Duration, percentile float64) float64 {
@@ -712,6 +730,8 @@ type regionSnapshot struct {
 	regionID              uint64
 	regionNumber          uint64
 	partition             string
+	partitionDescription  string
+	partitionExpression   string
 	leader                string
 	regionRows            uint64
 	writtenBytesSinceOpen uint64
@@ -727,48 +747,174 @@ type regionSnapshot struct {
 	role                  string
 }
 
-func (s *SampleLoader) observeRegions(ctx context.Context, options periodicOptions, writer *eventWriter, base benchmarkEvent) {
-	client := httpSQLClient{endpoint: options.ObserveSQLURL, database: options.TargetDatabase, authorization: s.authorizationHeader(), client: &http.Client{Timeout: 30 * time.Second}}
-	previous := make(map[uint64]regionSnapshot)
-	observe := func() {
-		now := time.Now()
-		current, err := client.regionSnapshots(ctx, options.TargetPhysicalTable, now)
-		if err != nil {
-			writer.emit(ctx, eventWith(base, "observation_error", "observe", 0, func(event *benchmarkEvent) { event.Error = err.Error() }))
-			return
-		}
-		seen := make(map[uint64]struct{}, len(current))
-		for _, snapshot := range current {
-			seen[snapshot.regionID] = struct{}{}
-			prior, exists := previous[snapshot.regionID]
-			event := regionEvent(base, snapshot, exists, prior)
-			writer.emit(ctx, event)
-			if !exists {
-				writer.emit(ctx, eventWith(event, "region_created", "observe", 0, nil))
-			} else if prior.leader != snapshot.leader {
-				writer.emit(ctx, eventWith(event, "leader_changed", "observe", 0, nil))
-			}
-		}
-		for id, snapshot := range previous {
-			if _, ok := seen[id]; !ok {
-				writer.emit(ctx, eventWith(regionEvent(base, snapshot, true, snapshot), "region_disappeared", "observe", 0, nil))
-			}
-		}
-		previous = make(map[uint64]regionSnapshot, len(current))
-		for _, snapshot := range current {
-			previous[snapshot.regionID] = snapshot
+type regionSnapshotBundle struct {
+	id             string
+	timestamp      time.Time
+	mappingVersion uint64
+	snapshots      []regionSnapshot
+	events         []benchmarkEvent
+	distribution   []sharedpartition.RegionDistribution
+	logicalTables  []string
+	refreshError   string
+	stale          bool
+}
+
+type regionSnapshotStore struct {
+	mu      sync.RWMutex
+	current *regionSnapshotBundle
+}
+
+func (s *regionSnapshotStore) set(bundle *regionSnapshotBundle) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = bundle
+}
+
+func (s *regionSnapshotStore) get() *regionSnapshotBundle {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current
+}
+
+func withSnapshotDetails(event benchmarkEvent, bundle *regionSnapshotBundle) benchmarkEvent {
+	details := map[string]any{}
+	if event.Details != "" {
+		if err := json.Unmarshal([]byte(event.Details), &details); err != nil {
+			details["message"] = event.Details
 		}
 	}
+	details["snapshot_id"] = bundle.id
+	details["snapshot_ts_ms"] = bundle.timestamp.UnixMilli()
+	details["mapping_version"] = bundle.mappingVersion
+	details["snapshot_stale"] = bundle.stale
+	if bundle.refreshError != "" {
+		details["snapshot_refresh_error"] = bundle.refreshError
+	}
+	encoded, err := json.Marshal(details)
+	if err == nil {
+		event.Details = string(encoded)
+	}
+	return event
+}
 
-	observe()
-	ticker := time.NewTicker(options.ObserveInterval)
+func configTables(fileConfigs []samples.FileConfig) ([]sharedpartition.ConfigTable, []string) {
+	tables := make([]sharedpartition.ConfigTable, 0, len(fileConfigs))
+	names := make([]string, 0, len(fileConfigs))
+	for _, fileConfig := range fileConfigs {
+		values := make(map[string][]string, len(fileConfig.Config.Tags))
+		for _, tag := range fileConfig.Config.Tags {
+			values[tag.Name] = tag.Dist.LabelGenerator().All()
+		}
+		tables = append(tables, sharedpartition.ConfigTable{Name: fileConfig.Name, LabelValues: values, SeriesCount: uint64(fileConfig.SeriesCount)})
+		names = append(names, fileConfig.Name)
+	}
+	sort.Strings(names)
+	return tables, names
+}
+
+type regionRefresher struct {
+	client        httpSQLClient
+	physicalTable string
+	configTables  []sharedpartition.ConfigTable
+	logicalTables []string
+	base          benchmarkEvent
+	previous      map[uint64]regionSnapshot
+	version       uint64
+	store         *regionSnapshotStore
+}
+
+func (r *regionRefresher) refresh(ctx context.Context) (*regionSnapshotBundle, []benchmarkEvent, error) {
+	now := time.Now()
+	snapshots, err := r.client.regionSnapshots(ctx, r.physicalTable, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	metadata, err := r.client.partitionMetadata(ctx, r.physicalTable)
+	if err != nil {
+		return nil, nil, err
+	}
+	showCreate, err := r.client.showCreateTable(ctx, r.physicalTable)
+	if err != nil {
+		return nil, nil, err
+	}
+	definition, err := sharedpartition.ParsePartitionDefinition(showCreate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse physical table partition definition: %w", err)
+	}
+	distribution, err := sharedpartition.ConfigRegionDistribution(&definition, metadata, r.configTables)
+	if err != nil {
+		return nil, nil, err
+	}
+	r.version++
+	bundle := &regionSnapshotBundle{id: newSnapshotID(), timestamp: now, mappingVersion: r.version, snapshots: snapshots, distribution: distribution, logicalTables: r.logicalTables}
+	for _, snapshot := range snapshots {
+		prior, exists := r.previous[snapshot.regionID]
+		bundle.events = append(bundle.events, regionEvent(r.base, snapshot, exists, prior))
+	}
+	changes := mappingChanges(r.base, bundle, r.previous)
+	r.previous = make(map[uint64]regionSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		r.previous[snapshot.regionID] = snapshot
+	}
+	r.store.set(bundle)
+	return bundle, changes, nil
+}
+
+func mappingChanges(base benchmarkEvent, bundle *regionSnapshotBundle, previous map[uint64]regionSnapshot) []benchmarkEvent {
+	changes := []benchmarkEvent{eventWith(base, "partition_mapping_snapshot", "observe", 0, func(event *benchmarkEvent) {
+		details, _ := json.Marshal(map[string]any{"configured_logical_tables": bundle.logicalTables, "region_distribution": bundle.distribution})
+		event.Details = string(details)
+	})}
+	seen := make(map[uint64]struct{}, len(bundle.snapshots))
+	for _, snapshot := range bundle.snapshots {
+		seen[snapshot.regionID] = struct{}{}
+		prior, exists := previous[snapshot.regionID]
+		current := regionEvent(base, snapshot, exists, prior)
+		if !exists {
+			changes = append(changes, eventWith(current, "region_created", "observe", 0, nil))
+		} else if prior.leader != snapshot.leader {
+			changes = append(changes, eventWith(current, "leader_changed", "observe", 0, nil))
+		} else if prior.partition != snapshot.partition || prior.partitionDescription != snapshot.partitionDescription || prior.partitionExpression != snapshot.partitionExpression {
+			changes = append(changes, eventWith(current, "partition_mapping_changed", "observe", 0, nil))
+		}
+	}
+	for regionID, snapshot := range previous {
+		if _, ok := seen[regionID]; !ok {
+			changes = append(changes, eventWith(regionEvent(base, snapshot, true, snapshot), "region_disappeared", "observe", 0, nil))
+		}
+	}
+	return changes
+}
+
+func newSnapshotID() string {
+	return fmt.Sprintf("snapshot-%d", time.Now().UnixNano())
+}
+
+func (r *regionRefresher) run(ctx context.Context, interval time.Duration, writer *eventWriter) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			observe()
+			bundle, changes, err := r.refresh(ctx)
+			if err != nil {
+				current := r.store.get()
+				if current != nil {
+					stale := *current
+					stale.stale = true
+					stale.refreshError = err.Error()
+					r.store.set(&stale)
+					writer.emitWithSnapshot(ctx, eventWith(r.base, "snapshot_refresh_error", "observe", 0, func(event *benchmarkEvent) { event.Error = err.Error() }), &stale)
+				} else {
+					writer.emit(ctx, eventWith(r.base, "snapshot_refresh_error", "observe", 0, func(event *benchmarkEvent) { event.Error = err.Error() }))
+				}
+				continue
+			}
+			for _, event := range changes {
+				writer.emitWithSnapshot(ctx, event, bundle)
+			}
 		}
 	}
 }
@@ -780,6 +926,8 @@ func regionEvent(base benchmarkEvent, snapshot regionSnapshot, exists bool, prev
 		event.RegionID = snapshot.regionID
 		event.RegionNumber = snapshot.regionNumber
 		event.Partition = snapshot.partition
+		event.PartitionDescription = snapshot.partitionDescription
+		event.PartitionExpression = snapshot.partitionExpression
 		event.LeaderDatanode = snapshot.leader
 		event.RegionRole = snapshot.role
 		event.Engine = snapshot.engine
@@ -823,7 +971,7 @@ type httpSQLClient struct {
 }
 
 func (c httpSQLClient) regionSnapshots(ctx context.Context, physicalTable string, now time.Time) ([]regionSnapshot, error) {
-	sql := `SELECT p.partition_name, p.greptime_partition_id, rp.peer_id, s.table_id, s.region_number, s.region_rows, s.written_bytes_since_open, s.query_cpu_time_millis, s.query_scanned_bytes, s.disk_size, s.memtable_size, s.manifest_size, s.sst_size, s.sst_num, s.index_size, s.engine, s.region_role FROM information_schema.partitions AS p LEFT JOIN information_schema.region_statistics AS s ON p.greptime_partition_id = s.region_id LEFT JOIN information_schema.region_peers AS rp ON s.region_id = rp.region_id AND rp.is_leader = 'Yes' WHERE p.table_schema = ` + quoteSQLLiteral(c.database) + ` AND p.table_name = ` + quoteSQLLiteral(physicalTable) + ` ORDER BY p.partition_ordinal_position`
+	sql := `SELECT p.partition_name, p.partition_expression, p.partition_description, p.greptime_partition_id, rp.peer_id, s.table_id, s.region_number, s.region_rows, s.written_bytes_since_open, s.query_cpu_time_millis, s.query_scanned_bytes, s.disk_size, s.memtable_size, s.manifest_size, s.sst_size, s.sst_num, s.index_size, s.engine, s.region_role FROM information_schema.partitions AS p LEFT JOIN information_schema.region_statistics AS s ON p.greptime_partition_id = s.region_id LEFT JOIN information_schema.region_peers AS rp ON s.region_id = rp.region_id AND rp.is_leader = 'Yes' WHERE p.table_schema = ` + quoteSQLLiteral(c.database) + ` AND p.table_name = ` + quoteSQLLiteral(physicalTable) + ` ORDER BY p.partition_ordinal_position`
 	rows, err := c.query(ctx, sql)
 	if err != nil {
 		return nil, err
@@ -834,9 +982,39 @@ func (c httpSQLClient) regionSnapshots(ctx context.Context, physicalTable string
 		if regionID == 0 {
 			continue
 		}
-		result = append(result, regionSnapshot{timestamp: now, partition: stringValue(row["partition_name"]), regionID: regionID, leader: stringValue(row["peer_id"]), tableID: uintValue(row["table_id"]), regionNumber: uintValue(row["region_number"]), regionRows: uintValue(row["region_rows"]), writtenBytesSinceOpen: uintValue(row["written_bytes_since_open"]), queryCPUTimeMillis: uintValue(row["query_cpu_time_millis"]), queryScannedBytes: uintValue(row["query_scanned_bytes"]), diskSize: uintValue(row["disk_size"]), memtableSize: uintValue(row["memtable_size"]), manifestSize: uintValue(row["manifest_size"]), sstSize: uintValue(row["sst_size"]), sstNum: uintValue(row["sst_num"]), indexSize: uintValue(row["index_size"]), engine: stringValue(row["engine"]), role: stringValue(row["region_role"])})
+		result = append(result, regionSnapshot{timestamp: now, partition: stringValue(row["partition_name"]), partitionExpression: stringValue(row["partition_expression"]), partitionDescription: stringValue(row["partition_description"]), regionID: regionID, leader: stringValue(row["peer_id"]), tableID: uintValue(row["table_id"]), regionNumber: uintValue(row["region_number"]), regionRows: uintValue(row["region_rows"]), writtenBytesSinceOpen: uintValue(row["written_bytes_since_open"]), queryCPUTimeMillis: uintValue(row["query_cpu_time_millis"]), queryScannedBytes: uintValue(row["query_scanned_bytes"]), diskSize: uintValue(row["disk_size"]), memtableSize: uintValue(row["memtable_size"]), manifestSize: uintValue(row["manifest_size"]), sstSize: uintValue(row["sst_size"]), sstNum: uintValue(row["sst_num"]), indexSize: uintValue(row["index_size"]), engine: stringValue(row["engine"]), role: stringValue(row["region_role"])})
 	}
 	return result, nil
+}
+
+func (c httpSQLClient) partitionMetadata(ctx context.Context, physicalTable string) ([]sharedpartition.Metadata, error) {
+	sql := `SELECT partition_name, partition_ordinal_position, partition_expression, partition_description, greptime_partition_id FROM information_schema.partitions WHERE table_schema = ` + quoteSQLLiteral(c.database) + ` AND table_name = ` + quoteSQLLiteral(physicalTable) + ` ORDER BY partition_ordinal_position`
+	rows, err := c.query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	metadata := make([]sharedpartition.Metadata, 0, len(rows))
+	for _, row := range rows {
+		metadata = append(metadata, sharedpartition.Metadata{Name: stringValue(row["partition_name"]), Ordinal: uintValue(row["partition_ordinal_position"]), Expression: stringValue(row["partition_expression"]), Description: stringValue(row["partition_description"]), RegionID: uintValue(row["greptime_partition_id"])})
+	}
+	return metadata, nil
+}
+
+func (c httpSQLClient) showCreateTable(ctx context.Context, physicalTable string) (string, error) {
+	rows, err := c.query(ctx, "SHOW CREATE TABLE "+quoteSQLIdentifier(physicalTable))
+	if err != nil {
+		return "", err
+	}
+	if len(rows) != 1 {
+		return "", fmt.Errorf("SHOW CREATE TABLE returned %d rows", len(rows))
+	}
+	for _, value := range rows[0] {
+		create := stringValue(value)
+		if strings.Contains(strings.ToUpper(create), "CREATE TABLE") {
+			return create, nil
+		}
+	}
+	return "", fmt.Errorf("SHOW CREATE TABLE returned no definition")
 }
 
 func (c httpSQLClient) query(ctx context.Context, sql string) ([]map[string]any, error) {
@@ -906,6 +1084,10 @@ func decodeSQLRows(body []byte) ([]map[string]any, error) {
 
 func quoteSQLLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func quoteSQLIdentifier(value string) string {
+	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
 }
 
 func uintValue(value any) uint64 {
