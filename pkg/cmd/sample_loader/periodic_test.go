@@ -23,6 +23,7 @@ func TestPeriodicOptionsRequireExplicitExpectation(t *testing.T) {
 		"pressure-high-min-write-bps": "1",
 		"baseline-duration":           "0s",
 		"burst-active-duration":       "1s",
+		"transient-burst-duration":    "1s",
 		"burst-period":                "1s",
 		"observe-interval":            "1s",
 	} {
@@ -44,6 +45,32 @@ func TestPeriodicOptionsRequireExplicitExpectation(t *testing.T) {
 	}
 	if options.TargetPhysicalTable != "metrics_physical" {
 		t.Fatalf("unexpected target physical table: %q", options.TargetPhysicalTable)
+	}
+}
+
+func TestSteadyTrafficDefaultsToMixedBursts(t *testing.T) {
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"target-physical-table":       "metrics_physical",
+		"pressure-high-min-write-bps": "8",
+		"baseline-duration":           "0s",
+		"burst-active-duration":       "1s",
+		"transient-burst-duration":    "1s",
+		"burst-period":                "1s",
+		"observe-interval":            "1s",
+		"autopilot-expect":            "both",
+		"periodic-traffic-mode":       "steady",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	options, err := periodicOptionsFromCommand(cmd, &SampleLoader{DryRun: true, TickInterval: time.Second, Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.BurstClass != burstClassMixed || options.BaselineTargetWriteBPS != 2 || options.QualifiedMaxWriteBPS != 24 {
+		t.Fatalf("unexpected steady defaults: %#v", options)
 	}
 }
 
@@ -119,6 +146,39 @@ func TestEventWriterIngestsNDJSON(t *testing.T) {
 	}
 }
 
+func TestBenchmarkEventEncodesZeroFloatFieldsAsFloat64(t *testing.T) {
+	encoded, err := json.Marshal(benchmarkEvent{RunID: "run-1", EventType: "pressure_started"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"\"write_bps\":0.0", "\"latency_max_ms\":0.0", "\"pressure_threshold_bps\":0.0", "\"written_bytes_bps\":0.0"} {
+		if !strings.Contains(string(encoded), field) {
+			t.Fatalf("expected %s in encoded event: %s", field, encoded)
+		}
+	}
+}
+
+func TestEventWriterRecoversAfterMonitoringFailure(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts++
+		if attempts <= 3 {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	writer := newEventWriter(periodicOptions{MonitoringURL: server.URL + "/v1/ingest"})
+	if err := writer.emitAndFlush(context.Background(), benchmarkEvent{RunID: "run-1", EventType: "pressure_started"}); err == nil {
+		t.Fatal("expected initial monitoring failure")
+	}
+	if err := writer.emitAndFlush(context.Background(), benchmarkEvent{RunID: "run-1", EventType: "workload_window"}); err != nil {
+		t.Fatalf("expected recovery after monitoring failure, got %v", err)
+	}
+}
+
 func TestEventWriterFlushesLifecycleEventImmediately(t *testing.T) {
 	received := make(chan benchmarkEvent, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -156,9 +216,38 @@ func TestSeededBurstScheduleIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestMixedBurstClassesAreSeededAndContainBothCategories(t *testing.T) {
+	first, _ := newPeriodicRandom(42)
+	second, _ := newPeriodicRandom(42)
+	seen := map[burstClass]bool{}
+	for range 16 {
+		got := nextBurstClass(burstClassMixed, first)
+		if got != nextBurstClass(burstClassMixed, second) {
+			t.Fatal("mixed schedule must be deterministic with a seed")
+		}
+		seen[got] = true
+	}
+	if !seen[burstClassTransient] || !seen[burstClassQualified] {
+		t.Fatalf("mixed schedule did not cover both classes: %#v", seen)
+	}
+}
+
+func TestBurstClassDefinesExpectationAndTarget(t *testing.T) {
+	options := periodicOptions{TransientBurstDuration: 5 * time.Minute, BurstActiveDuration: 30 * time.Minute, BaselineTargetWriteBPS: 2, PressureHighMinWriteBPS: 8}
+	if got := burstClassTransient.expectation("both"); got != "none" {
+		t.Fatalf("transient expectation = %q", got)
+	}
+	if got := burstClassQualified.initialTargetBPS(options); got != 12 {
+		t.Fatalf("qualified target = %v", got)
+	}
+	if got := burstClassTransient.duration(options); got != 5*time.Minute {
+		t.Fatalf("transient duration = %s", got)
+	}
+}
+
 func TestPlannedBurstEventRecordsSeedAndSchedule(t *testing.T) {
 	scheduled := time.Unix(100, 0)
-	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024}, 42, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true)
+	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256}, 42, burstClassQualified, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true)
 	if event.EventType != "pressure_scheduled" || event.Phase != "baseline" || event.Cycle != 2 || event.ScheduledTSMS != scheduled.UnixMilli() {
 		t.Fatalf("unexpected planned event: %#v", event)
 	}

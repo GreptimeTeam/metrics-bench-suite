@@ -35,6 +35,17 @@ type SendStats struct {
 	PayloadBytes int
 }
 
+// PreparedWriteRequest is a marshaled and compressed v1 remote-write payload.
+// It lets callers apply admission control without serializing a request twice.
+type PreparedWriteRequest struct {
+	compressedData []byte
+}
+
+// PayloadBytes returns the encoded on-the-wire payload size.
+func (p PreparedWriteRequest) PayloadBytes() int {
+	return len(p.compressedData)
+}
+
 // NewRequester creates a new requester
 func NewRequester(url string) *Requester {
 	return &Requester{
@@ -67,14 +78,28 @@ func (r *Requester) SendContext(ctx context.Context, writeRequest prompb.WriteRe
 
 // SendWithStats sends a v1 remote-write request and returns the compressed payload size.
 func (r *Requester) SendWithStats(writeRequest prompb.WriteRequest) (SendStats, error) {
-	protobufData, err := writeRequest.Marshal()
+	prepared, err := PrepareWriteRequest(writeRequest)
 	if err != nil {
 		return SendStats{}, err
 	}
-	compressedData := snappy.Encode(nil, protobufData)
-	stats := SendStats{PayloadBytes: len(compressedData)}
-	_, err = r.sendCompressed(context.Background(), compressedData, contentTypeV1, remoteWriteVersionV1)
+	stats := SendStats{PayloadBytes: prepared.PayloadBytes()}
+	err = r.SendPrepared(context.Background(), prepared)
 	return stats, err
+}
+
+// PrepareWriteRequest marshals and compresses a v1 remote-write request once.
+func PrepareWriteRequest(writeRequest prompb.WriteRequest) (PreparedWriteRequest, error) {
+	protobufData, err := writeRequest.Marshal()
+	if err != nil {
+		return PreparedWriteRequest{}, err
+	}
+	return PreparedWriteRequest{compressedData: snappy.Encode(nil, protobufData)}, nil
+}
+
+// SendPrepared sends a payload returned by PrepareWriteRequest with cancellation.
+func (r *Requester) SendPrepared(ctx context.Context, prepared PreparedWriteRequest) error {
+	_, err := r.sendCompressed(ctx, prepared.compressedData, contentTypeV1, remoteWriteVersionV1)
+	return err
 }
 
 // SendV2 sends a Prometheus remote write 2.0 request.
