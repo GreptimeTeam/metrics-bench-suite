@@ -2,6 +2,25 @@ package partition
 
 import "testing"
 
+func TestParsePartitionDefinitionAcceptsDoubleQuotedColumns(t *testing.T) {
+	definition, err := ParsePartitionDefinition(`CREATE TABLE IF NOT EXISTS "greptime_physical_table" (
+  "greptime_timestamp" TIMESTAMP(3) NOT NULL,
+  "namespace" STRING NULL,
+  TIME INDEX ("greptime_timestamp"),
+  PRIMARY KEY ("namespace")
+)
+PARTITION ON COLUMNS ("namespace") (
+  namespace < 'app-1',
+  namespace >= 'app-1'
+)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(definition.Columns) != 1 || definition.Columns[0] != "namespace" || len(definition.Partitions) != 2 {
+		t.Fatalf("unexpected partition definition: %#v", definition)
+	}
+}
+
 func TestFindMetadataByColumnValueUsesMetadataAndFallbackDDL(t *testing.T) {
 	definition, err := ParsePartitionDefinition("PARTITION ON COLUMNS (namespace) ((namespace < 'app-1'), (namespace >= 'app-1'))")
 	if err != nil {
