@@ -1,0 +1,60 @@
+pkg/cmd/partition_query_loader/partition.go
+  s_c43176d290fd97::t_aa6b2d0ce65c88 7-8,20
+  s_c43176d290fd97::t_f6c55a331c1fae 10-15,17-18
+pkg/partition/partition.go
+  s_c43176d290fd97::t_f6c55a331c1fae 1-371
+pkg/cmd/sample_loader/periodic_test.go
+  s_c43176d290fd97::t_79221947a565d7 122,125-127
+  s_c43176d290fd97::t_7c9c2201aa73e3 91,108,174
+  s_c43176d290fd97::t_14520398c12234 41-42
+  s_c43176d290fd97::t_782e00bdafdbb5 140
+  s_c43176d290fd97::t_0e6a9395da1bb5 118-121,123-124,128-139,141-157
+pkg/cmd/sample_loader/periodic.go
+  s_c43176d290fd97::t_afe91ee0893642 24,97,134,195-196,252,316-317,369,381,571
+  s_c43176d290fd97::t_1f5a8113a5e192 451-456,459-460,463-476,481,485,503,505,520,525,527,532,534,540,552,556,600,609,613
+  s_c43176d290fd97::t_8ce69439e24746 258-280
+  s_c43176d290fd97::t_f4c71c2c899800 751-759
+  s_c43176d290fd97::t_a48a02c0b53c4a 733-734
+  s_c43176d290fd97::t_7f4cf8b8ab0d75 639,643,648,650,655,658,662,667-680
+  s_c43176d290fd97::t_4dca253a730d0d 836,838-846
+  s_c43176d290fd97::t_0f76dae980698b 877-878
+  s_c43176d290fd97::t_3888f160276485 750,760-783,785-806,808-835,837,847-876,880-883,886-887,889-892
+  s_c43176d290fd97::t_abecc4d3f9f352 893-894,901-917
+  s_c43176d290fd97::t_ba09793d8004d2 929-930
+  s_c43176d290fd97::t_d25c92688fb906 681,974,985,990-1018,1091
+  s_c43176d290fd97::t_d474a883a1b588 1089-1090
+  s_c43176d290fd97::t_dd38df0ccfa6bd 682
+  s_c43176d290fd97::t_95135862cf9f23 1019
+  s_c43176d290fd97::t_b7eb08f6ab1443 1092
+pkg/partition/metadata_test.go
+  s_c43176d290fd97::t_783a322dcf8332 1-34
+  s_c43176d290fd97::t_a5fb91e96ee30a 54-64
+  s_c43176d290fd97::t_032fec6b3b8942 35-53
+pkg/cmd/partition_query_loader/discovery.go
+  s_c43176d290fd97::t_f6c55a331c1fae 11-12,174,193-194,196,198
+pkg/cmd/sample_loader/sample_loader.go
+  s_c43176d290fd97::t_d515b66886dae3 619
+pkg/partition/metadata.go
+  s_c43176d290fd97::t_2f05ca1aa3dcb8 5-8,80
+  s_c43176d290fd97::t_f55a50d796e31f 9,66-79,81-89,196-197,199-204,206-208,280-314
+  s_c43176d290fd97::t_c43eaeee6146ee 19-33,36-37,90-107,111-113,120-121,124,128-129,131-132,134-135,137-142,158-165,178-195,198,205,209-279
+  s_c43176d290fd97::t_652c38bc8d1d9c 34-35,108-110,114-119,166-177
+  s_c43176d290fd97::t_336d343e9d155d 122-123,125-127,130,133,136,143-157
+  s_c43176d290fd97::t_3f324e12fe63de 1-4,10-18,38-65,315-358
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "62dfcc2ba8fe839026e46bdac7e8276e63525ba5",
+  "prompts": {},
+  "sessions": {
+    "s_c43176d290fd97": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb9f-8822-70f1-a730-37d4d0368ea2",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
