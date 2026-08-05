@@ -646,6 +646,7 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().String("target-database", "public", "Database containing the target physical table")
 	rootCmd.Flags().String("target-physical-table", "", "Physical table to observe in periodic-burst mode")
 	rootCmd.Flags().String("autopilot-expect", "", "Expected Enterprise automation: repartition, rebalance, or both")
+	rootCmd.Flags().String("autopilot-case", "", "Source-derived scheduler case: repartition, migration, or transient")
 	rootCmd.Flags().Float64("pressure-high-min-write-bps", 0, "Minimum sustained payload bytes per second considered high pressure")
 	rootCmd.Flags().String("periodic-traffic-mode", "legacy", "Periodic traffic controller: legacy or steady (global payload-byte pacing)")
 	rootCmd.Flags().String("burst-class", "", "Burst class: mixed, transient, or qualified; steady mode defaults to mixed")
