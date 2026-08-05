@@ -1,0 +1,23 @@
+pkg/cmd/sample_loader/periodic.go
+  s_c43176d290fd97::t_c226a5cc3cb71e 38,51,98-100,162-163,186-188,261-281,283-284,287,810,813,816,861,876-886,1136,1138
+pkg/cmd/sample_loader/periodic_test.go
+  s_c43176d290fd97::t_62620a2a33a6a7 7,73,223-227,230-236,253-270
+pkg/cmd/sample_loader/sample_loader.go
+  s_c43176d290fd97::t_6280cc72b76d1a 621
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "865c1149fdd6e1e84bf70b756ba08fa49410a0f4",
+  "prompts": {},
+  "sessions": {
+    "s_c43176d290fd97": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb9f-8822-70f1-a730-37d4d0368ea2",
+        "model": "unknown"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
