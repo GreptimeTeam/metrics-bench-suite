@@ -1,0 +1,25 @@
+pkg/samples/file_config_timeseries.go
+  s_c43176d290fd97::t_e82ef0585f8367 20-26,30-35,41,43-45,75-83,85-91
+  s_c43176d290fd97::t_4aceabfc4322da 42,84
+  s_c43176d290fd97::t_40bfb9a8c7de5c 92
+pkg/cmd/sample_loader/periodic.go
+  s_c43176d290fd97::t_dea34d391795b8 543,551-563,582-586,669,676-677,682,685,705-723,732-741,762-773,877,949,961-962,965-967,973,999-1002,1004-1024,1026-1038,1040-1042,1076,1079,1085,1107-1110,1142-1143,1148-1149,1215,1221,1224,1226,1275-1311
+pkg/cmd/sample_loader/sample_loader.go
+  s_c43176d290fd97::t_f87ac67e959cc5 510,514-520,530,589-600
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "2a48b622dae6bf6ff65d9b3823977ef37d4d1106",
+  "prompts": {},
+  "sessions": {
+    "s_c43176d290fd97": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb9f-8822-70f1-a730-37d4d0368ea2",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
