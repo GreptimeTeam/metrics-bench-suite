@@ -17,13 +17,31 @@ func (f *FileConfig) GeneratePermutedTimeSeries(current time.Time, churnEpoch in
 
 // GeneratePermutedTimeSeriesContext generates time series until complete or canceled.
 func (f *FileConfig) GeneratePermutedTimeSeriesContext(ctx context.Context, current time.Time, churnEpoch int64, replica int, out chan<- prompb.TimeSeries) {
+	f.GeneratePermutedTimeSeriesWithLabelValuesContext(ctx, current, churnEpoch, replica, nil, out)
+}
+
+// GeneratePermutedTimeSeriesWithLabelValuesContext generates only permutations
+// matching the supplied label values. A constrained label must exist in the
+// file config and contain the requested value; otherwise it emits no series.
+func (f *FileConfig) GeneratePermutedTimeSeriesWithLabelValuesContext(ctx context.Context, current time.Time, churnEpoch int64, replica int, labelValues map[string]string, out chan<- prompb.TimeSeries) {
 	labels := make([]LabelCandidates, 0, len(f.Config.Tags))
 	for _, tag := range f.Config.Tags {
 		values := tag.Dist.LabelGenerator().All()
+		if value, ok := labelValues[tag.Name]; ok {
+			if !containsLabelValue(values, value) {
+				return
+			}
+			values = []string{value}
+		}
 		labels = append(labels, LabelCandidates{
 			Name:   tag.Name,
 			Values: values,
 		})
+	}
+	for labelName := range labelValues {
+		if !hasConfigLabel(f.Config.Tags, labelName) {
+			return
+		}
 	}
 
 	seriesIdx := 0
@@ -52,6 +70,24 @@ func (f *FileConfig) GeneratePermutedTimeSeriesContext(ctx context.Context, curr
 			return false
 		}
 	})
+}
+
+func containsLabelValue(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func hasConfigLabel(tags []Tag, wanted string) bool {
+	for _, tag := range tags {
+		if tag.Name == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // processSingleFileConfigSeries builds one TimeSeries for a single label-series from a file config.

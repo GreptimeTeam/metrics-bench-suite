@@ -1,6 +1,7 @@
 package samples
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -84,6 +85,33 @@ func TestGeneratePermutedTimeSeries_ChurnsDeterministicSubset(t *testing.T) {
 	secondZulu, _ := getLabelValue(timeSeries[1].Labels, "zulu")
 	if firstAlpha != "a1" || firstZulu != "z1" || secondAlpha != "a2" || secondZulu != "z1" {
 		t.Fatalf("unexpected permutation order for churned series")
+	}
+}
+
+func TestGeneratePermutedTimeSeriesWithLabelValuesRestrictsBeforeGeneration(t *testing.T) {
+	fileConfig := buildChurnTestFileConfig()
+	out := make(chan prompb.TimeSeries, 4)
+	fileConfig.GeneratePermutedTimeSeriesWithLabelValuesContext(context.Background(), time.Unix(1, 0), 0, 0, map[string]string{"alpha": "a2"}, out)
+	close(out)
+
+	var series []prompb.TimeSeries
+	for ts := range out {
+		series = append(series, ts)
+	}
+	if len(series) != 2 {
+		t.Fatalf("restricted series = %d, want 2", len(series))
+	}
+	for _, ts := range series {
+		if value, _ := getLabelValue(ts.Labels, "alpha"); value != "a2" {
+			t.Fatalf("unexpected restricted label value: %#v", ts.Labels)
+		}
+	}
+
+	out = make(chan prompb.TimeSeries, 1)
+	fileConfig.GeneratePermutedTimeSeriesWithLabelValuesContext(context.Background(), time.Unix(1, 0), 0, 0, map[string]string{"missing": "value"}, out)
+	close(out)
+	if got := len(out); got != 0 {
+		t.Fatalf("missing label emitted %d series", got)
 	}
 }
 
