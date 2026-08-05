@@ -248,7 +248,20 @@ After a duration run stops generation and finishes its bounded drain, it logs
 client-side totals and throughput:
 
 ```text
-Run statistics: elapsed=1m0.042s requests_total=250 requests_succeeded=249 requests_failed=1 samples_total=1230100 samples_in_succeeded_requests=1225100 samples_in_failed_requests=5000 samples_per_second=20403.98 dry_run=false
+Run statistics:
+  elapsed:                       1m0.042s
+  requests_total:                250
+  requests_succeeded:            249
+  requests_failed:               1
+  samples_total:                 1230100
+  samples_in_succeeded_requests: 1225100
+  samples_in_failed_requests:    5000
+  samples_per_second:            20403.98
+  request_time_total:            10.5s
+  request_time_avg:              42ms
+  request_time_min:              31ms
+  request_time_max:              78ms
+  dry_run:                       false
 ```
 
 The rate counts samples from requests the client considered successful and
@@ -294,8 +307,6 @@ V2 mode does not currently generate native histograms, exemplars, metadata, or
 created timestamps. The `_v2` suffix in a config directory name does not select
 the wire protocol; only `--remote-write-version` does. See the
 [Prometheus remote-write specification][prometheus-spec] for the full protocol.
-The optional text dump represents the decoded protobuf message, not the exact
-Snappy-compressed bytes sent over HTTP.
 
 The relevant implementation is in:
 

@@ -523,6 +523,22 @@ func TestWorkerCancelsAfterDrainTimeout(t *testing.T) {
 	}
 }
 
+func TestRunRejectsNonPositiveDuration(t *testing.T) {
+	for _, duration := range []string{"0s", "-5s"} {
+		cmd := NewCommand()
+		if err := cmd.Flags().Set("dry-run", "true"); err != nil {
+			t.Fatalf("set dry-run: %v", err)
+		}
+		if err := cmd.Flags().Set("duration", duration); err != nil {
+			t.Fatalf("set duration: %v", err)
+		}
+		err := (&SampleLoader{}).run(cmd, nil)
+		if err == nil || !strings.Contains(err.Error(), "duration must be greater than zero") {
+			t.Fatalf("duration %q: expected non-positive duration error, got %v", duration, err)
+		}
+	}
+}
+
 func TestRunRejectsDurationWithInfinite(t *testing.T) {
 	cmd := NewCommand()
 	for name, value := range map[string]string{

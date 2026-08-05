@@ -26,7 +26,7 @@ const (
 	remoteWriteV2
 )
 
-// ponytail: fixed grace keeps shutdown bounded; add a flag only if receiver latency needs tuning.
+// Fixed grace keeps shutdown bounded; add a flag only if receiver latency needs tuning.
 const drainGracePeriod = 30 * time.Second
 
 func parseRemoteWriteVersion(value string) (remoteWriteVersion, error) {
@@ -460,7 +460,7 @@ func convertToRemoteWriteV2Request(request prompb.WriteRequest) writev2.Request 
 
 	for i := range request.Timeseries {
 		source := &request.Timeseries[i]
-		labelRefs := make([]uint32, 0, len(source.Labels))
+		labelRefs := make([]uint32, 0, 2*len(source.Labels))
 		for j := range source.Labels {
 			labelRefs = append(labelRefs, symbols.Symbolize(source.Labels[j].Name))
 			labelRefs = append(labelRefs, symbols.Symbolize(source.Labels[j].Value))
