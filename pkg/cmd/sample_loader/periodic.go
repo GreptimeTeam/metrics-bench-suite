@@ -37,6 +37,7 @@ const (
 	defaultBurstPeriod      = time.Hour
 	defaultBurstJitter      = 0.2
 	defaultObserveInterval  = 15 * time.Second
+	defaultTransientBurst   = 5 * time.Minute
 	workloadWindowInterval  = 10 * time.Second
 )
 
@@ -44,6 +45,7 @@ type periodicOptions struct {
 	BaselineDuration        time.Duration
 	BaselineTickInterval    time.Duration
 	BurstActiveDuration     time.Duration
+	TransientBurstDuration  time.Duration
 	BurstPeriod             time.Duration
 	BurstJitter             float64
 	BurstAmplification      uint64
@@ -55,6 +57,10 @@ type periodicOptions struct {
 	TargetPhysicalTable     string
 	AutopilotExpect         string
 	PressureHighMinWriteBPS float64
+	TrafficMode             string
+	BurstClass              burstClass
+	BaselineTargetWriteBPS  float64
+	QualifiedMaxWriteBPS    float64
 	MonitoringURL           string
 	MonitoringAuthorization string
 	AutopilotConfigSnapshot string
@@ -80,6 +86,9 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	}
 	if options.BurstActiveDuration, err = parseDuration("burst-active-duration"); err != nil {
 		return periodicOptions{}, fmt.Errorf("parse burst-active-duration: %w", err)
+	}
+	if options.TransientBurstDuration, err = parseDuration("transient-burst-duration"); err != nil {
+		return periodicOptions{}, fmt.Errorf("parse transient-burst-duration: %w", err)
 	}
 	if options.BurstPeriod, err = parseDuration("burst-period"); err != nil {
 		return periodicOptions{}, fmt.Errorf("parse burst-period: %w", err)
@@ -114,6 +123,19 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	if options.PressureHighMinWriteBPS, err = cmd.Flags().GetFloat64("pressure-high-min-write-bps"); err != nil {
 		return periodicOptions{}, err
 	}
+	if options.TrafficMode, err = cmd.Flags().GetString("periodic-traffic-mode"); err != nil {
+		return periodicOptions{}, err
+	}
+	burstClassValue, err := cmd.Flags().GetString("burst-class")
+	if err != nil {
+		return periodicOptions{}, err
+	}
+	if options.BaselineTargetWriteBPS, err = cmd.Flags().GetFloat64("baseline-target-write-bps"); err != nil {
+		return periodicOptions{}, err
+	}
+	if options.QualifiedMaxWriteBPS, err = cmd.Flags().GetFloat64("qualified-max-write-bps"); err != nil {
+		return periodicOptions{}, err
+	}
 	if options.MonitoringURL, err = cmd.Flags().GetString("self-monitoring-url"); err != nil {
 		return periodicOptions{}, err
 	}
@@ -132,8 +154,8 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 		options.AutopilotConfigHash = hex.EncodeToString(digest[:])
 	}
 
-	if options.BaselineDuration < 0 || options.BaselineTickInterval <= 0 || options.BurstActiveDuration <= 0 || options.BurstPeriod < options.BurstActiveDuration || options.ObserveInterval <= 0 {
-		return periodicOptions{}, fmt.Errorf("baseline-duration must not be negative; baseline-tick-interval, burst-active-duration, and observe-interval must be positive; burst-period must be at least burst-active-duration")
+	if options.BaselineDuration < 0 || options.BaselineTickInterval <= 0 || options.BurstActiveDuration <= 0 || options.TransientBurstDuration <= 0 || options.BurstPeriod < options.BurstActiveDuration || options.BurstPeriod < options.TransientBurstDuration || options.ObserveInterval <= 0 {
+		return periodicOptions{}, fmt.Errorf("baseline-duration must not be negative; baseline-tick-interval, burst-active-duration, transient-burst-duration, and observe-interval must be positive; burst-period must be at least each burst duration")
 	}
 	if options.BurstJitter < 0 || options.BurstJitter > 1 {
 		return periodicOptions{}, fmt.Errorf("burst-jitter must be between 0 and 1")
@@ -153,6 +175,30 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	if options.PressureHighMinWriteBPS <= 0 {
 		return periodicOptions{}, fmt.Errorf("pressure-high-min-write-bps must be greater than zero in periodic-burst mode")
 	}
+	if options.TrafficMode != "legacy" && options.TrafficMode != "steady" {
+		return periodicOptions{}, fmt.Errorf("periodic-traffic-mode must be legacy or steady")
+	}
+	if burstClassValue == "" {
+		if options.TrafficMode == "steady" {
+			options.BurstClass = burstClassMixed
+		} else {
+			options.BurstClass = burstClassQualified
+		}
+	} else {
+		options.BurstClass = burstClass(burstClassValue)
+	}
+	if !options.BurstClass.valid() {
+		return periodicOptions{}, fmt.Errorf("burst-class must be mixed, transient, or qualified")
+	}
+	if options.BaselineTargetWriteBPS < 0 || options.QualifiedMaxWriteBPS < 0 {
+		return periodicOptions{}, fmt.Errorf("baseline-target-write-bps and qualified-max-write-bps must not be negative")
+	}
+	if options.BaselineTargetWriteBPS == 0 {
+		options.BaselineTargetWriteBPS = options.PressureHighMinWriteBPS * 0.25
+	}
+	if options.QualifiedMaxWriteBPS == 0 {
+		options.QualifiedMaxWriteBPS = options.PressureHighMinWriteBPS * 3
+	}
 	if loader.DryRun {
 		return options, nil
 	}
@@ -169,6 +215,49 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 		return periodicOptions{}, fmt.Errorf("parse monitoring-url: %w", err)
 	}
 	return options, nil
+}
+
+type burstClass string
+
+const (
+	burstClassMixed     burstClass = "mixed"
+	burstClassTransient burstClass = "transient"
+	burstClassQualified burstClass = "qualified"
+)
+
+func (c burstClass) valid() bool {
+	return c == burstClassMixed || c == burstClassTransient || c == burstClassQualified
+}
+
+func (c burstClass) expectation(configured string) string {
+	if c == burstClassTransient {
+		return "none"
+	}
+	return configured
+}
+
+func (c burstClass) duration(options periodicOptions) time.Duration {
+	if c == burstClassTransient {
+		return options.TransientBurstDuration
+	}
+	return options.BurstActiveDuration
+}
+
+func (c burstClass) initialTargetBPS(options periodicOptions) float64 {
+	if c == burstClassQualified {
+		return options.PressureHighMinWriteBPS * 1.5
+	}
+	return options.BaselineTargetWriteBPS
+}
+
+func nextBurstClass(configured burstClass, random *mathrand.Rand) burstClass {
+	if configured != burstClassMixed {
+		return configured
+	}
+	if random.Intn(2) == 0 {
+		return burstClassTransient
+	}
+	return burstClassQualified
 }
 
 func redactConfigSnapshot(snapshot string) string {
@@ -204,64 +293,75 @@ func replaceEndpointPath(value, path string) (string, error) {
 	return parsed.String(), nil
 }
 
+type floatEventValue float64
+
+func (f floatEventValue) MarshalJSON() ([]byte, error) {
+	value := strconv.FormatFloat(float64(f), 'f', -1, 64)
+	if !strings.ContainsAny(value, ".eE") {
+		value += ".0"
+	}
+	return []byte(value), nil
+}
+
 type benchmarkEvent struct {
-	EventTSMS                 int64   `json:"event_ts_ms"`
-	EventSequence             uint64  `json:"event_sequence"`
-	RunID                     string  `json:"run_id"`
-	EventType                 string  `json:"event_type"`
-	Phase                     string  `json:"phase"`
-	Cycle                     uint64  `json:"cycle"`
-	TargetDatabase            string  `json:"target_database"`
-	LogicalTable              string  `json:"logical_table"`
-	PhysicalTable             string  `json:"physical_table"`
-	TableID                   uint64  `json:"table_id"`
-	RegionID                  uint64  `json:"region_id"`
-	RegionNumber              uint64  `json:"region_number"`
-	Partition                 string  `json:"partition"`
-	PartitionDescription      string  `json:"partition_description"`
-	PartitionExpression       string  `json:"partition_expression"`
-	LeaderDatanode            string  `json:"leader_datanode"`
-	RegionRole                string  `json:"region_role"`
-	Engine                    string  `json:"engine"`
-	WindowStartMS             int64   `json:"window_start_ms"`
-	WindowEndMS               int64   `json:"window_end_ms"`
-	ScheduledTSMS             int64   `json:"scheduled_ts_ms"`
-	ActualTSMS                int64   `json:"actual_ts_ms"`
-	ScheduleDelayMS           int64   `json:"schedule_delay_ms"`
-	RequestCount              uint64  `json:"request_count"`
-	SampleCount               uint64  `json:"sample_count"`
-	PayloadBytes              uint64  `json:"payload_bytes"`
-	SuccessCount              uint64  `json:"success_count"`
-	ErrorCount                uint64  `json:"error_count"`
-	WriteBPS                  float64 `json:"write_bps"`
-	LatencyP50MS              float64 `json:"latency_p50_ms"`
-	LatencyP95MS              float64 `json:"latency_p95_ms"`
-	LatencyMaxMS              float64 `json:"latency_max_ms"`
-	PressureThresholdBPS      float64 `json:"pressure_threshold_bps"`
-	ConsecutiveHighWindows    uint64  `json:"consecutive_high_windows"`
-	RegionRows                uint64  `json:"region_rows"`
-	WrittenBytesSinceOpen     uint64  `json:"written_bytes_since_open"`
-	QueryCPUTimeMillis        uint64  `json:"query_cpu_time_millis"`
-	QueryScannedBytes         uint64  `json:"query_scanned_bytes"`
-	DiskSize                  uint64  `json:"disk_size"`
-	MemtableSize              uint64  `json:"memtable_size"`
-	ManifestSize              uint64  `json:"manifest_size"`
-	SSTSize                   uint64  `json:"sst_size"`
-	SSTNum                    uint64  `json:"sst_num"`
-	IndexSize                 uint64  `json:"index_size"`
-	IntervalMS                int64   `json:"interval_ms"`
-	MemtableSizeDeltaBytes    int64   `json:"memtable_size_delta_bytes"`
-	MemtableWriteBPSApprox    float64 `json:"memtable_write_bps_approx"`
-	WrittenBytesBPS           float64 `json:"written_bytes_bps"`
-	RegionNew                 bool    `json:"region_new"`
-	CounterReset              bool    `json:"counter_reset"`
-	MemtableDecreased         bool    `json:"memtable_decreased"`
-	AnalysisContextIncomplete bool    `json:"analysis_context_incomplete"`
-	AutopilotExpect           string  `json:"autopilot_expect"`
-	AutopilotConfigHash       string  `json:"autopilot_config_hash"`
-	AutopilotConfigSnapshot   string  `json:"autopilot_config_snapshot"`
-	Error                     string  `json:"error"`
-	Details                   string  `json:"details"`
+	EventTSMS                 int64           `json:"event_ts_ms"`
+	EventSequence             uint64          `json:"event_sequence"`
+	RunID                     string          `json:"run_id"`
+	EventType                 string          `json:"event_type"`
+	Phase                     string          `json:"phase"`
+	Cycle                     uint64          `json:"cycle"`
+	TargetDatabase            string          `json:"target_database"`
+	LogicalTable              string          `json:"logical_table"`
+	PhysicalTable             string          `json:"physical_table"`
+	TableID                   uint64          `json:"table_id"`
+	RegionID                  uint64          `json:"region_id"`
+	RegionNumber              uint64          `json:"region_number"`
+	Partition                 string          `json:"partition"`
+	PartitionDescription      string          `json:"partition_description"`
+	PartitionExpression       string          `json:"partition_expression"`
+	LeaderDatanode            string          `json:"leader_datanode"`
+	RegionRole                string          `json:"region_role"`
+	Engine                    string          `json:"engine"`
+	WindowStartMS             int64           `json:"window_start_ms"`
+	WindowEndMS               int64           `json:"window_end_ms"`
+	ScheduledTSMS             int64           `json:"scheduled_ts_ms"`
+	ActualTSMS                int64           `json:"actual_ts_ms"`
+	ScheduleDelayMS           int64           `json:"schedule_delay_ms"`
+	RequestCount              uint64          `json:"request_count"`
+	SampleCount               uint64          `json:"sample_count"`
+	PayloadBytes              uint64          `json:"payload_bytes"`
+	SuccessCount              uint64          `json:"success_count"`
+	ErrorCount                uint64          `json:"error_count"`
+	WriteBPS                  floatEventValue `json:"write_bps"`
+	LatencyP50MS              floatEventValue `json:"latency_p50_ms"`
+	LatencyP95MS              floatEventValue `json:"latency_p95_ms"`
+	LatencyMaxMS              floatEventValue `json:"latency_max_ms"`
+	PressureThresholdBPS      floatEventValue `json:"pressure_threshold_bps"`
+	ConsecutiveHighWindows    uint64          `json:"consecutive_high_windows"`
+	RegionRows                uint64          `json:"region_rows"`
+	WrittenBytesSinceOpen     uint64          `json:"written_bytes_since_open"`
+	QueryCPUTimeMillis        uint64          `json:"query_cpu_time_millis"`
+	QueryScannedBytes         uint64          `json:"query_scanned_bytes"`
+	DiskSize                  uint64          `json:"disk_size"`
+	MemtableSize              uint64          `json:"memtable_size"`
+	ManifestSize              uint64          `json:"manifest_size"`
+	SSTSize                   uint64          `json:"sst_size"`
+	SSTNum                    uint64          `json:"sst_num"`
+	IndexSize                 uint64          `json:"index_size"`
+	IntervalMS                int64           `json:"interval_ms"`
+	MemtableSizeDeltaBytes    int64           `json:"memtable_size_delta_bytes"`
+	MemtableWriteBPSApprox    floatEventValue `json:"memtable_write_bps_approx"`
+	WrittenBytesBPS           floatEventValue `json:"written_bytes_bps"`
+	BurstClass                string          `json:"burst_class"`
+	RegionNew                 bool            `json:"region_new"`
+	CounterReset              bool            `json:"counter_reset"`
+	MemtableDecreased         bool            `json:"memtable_decreased"`
+	AnalysisContextIncomplete bool            `json:"analysis_context_incomplete"`
+	AutopilotExpect           string          `json:"autopilot_expect"`
+	AutopilotConfigHash       string          `json:"autopilot_config_hash"`
+	AutopilotConfigSnapshot   string          `json:"autopilot_config_snapshot"`
+	Error                     string          `json:"error"`
+	Details                   string          `json:"details"`
 }
 
 type eventWriter struct {
@@ -283,7 +383,9 @@ func (w *eventWriter) emit(ctx context.Context, event benchmarkEvent) {
 	defer w.mu.Unlock()
 	w.appendLocked(event)
 	if len(w.pending) >= 100 {
-		w.flushLocked(ctx)
+		if err := w.flushLocked(ctx); err != nil {
+			log.Printf("periodic-burst: ingest benchmark events: %v", err)
+		}
 	}
 }
 
@@ -292,8 +394,7 @@ func (w *eventWriter) emitAndFlush(ctx context.Context, event benchmarkEvent) er
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.appendLocked(event)
-	w.flushLocked(ctx)
-	return w.firstErr
+	return w.flushLocked(ctx)
 }
 
 func (w *eventWriter) emitWithSnapshot(ctx context.Context, event benchmarkEvent, bundle *regionSnapshotBundle) {
@@ -308,7 +409,9 @@ func (w *eventWriter) emitWithSnapshot(ctx context.Context, event benchmarkEvent
 		w.appendLocked(withSnapshotDetails(snapshotEvent, bundle))
 	}
 	if len(w.pending) >= 100 {
-		w.flushLocked(ctx)
+		if err := w.flushLocked(ctx); err != nil {
+			log.Printf("periodic-burst: ingest benchmark events: %v", err)
+		}
 	}
 }
 
@@ -323,8 +426,7 @@ func (w *eventWriter) emitWithSnapshotAndFlush(ctx context.Context, event benchm
 	for _, snapshotEvent := range bundle.events {
 		w.appendLocked(withSnapshotDetails(snapshotEvent, bundle))
 	}
-	w.flushLocked(ctx)
-	return w.firstErr
+	return w.flushLocked(ctx)
 }
 
 func (w *eventWriter) appendLocked(event benchmarkEvent) {
@@ -339,13 +441,12 @@ func (w *eventWriter) appendLocked(event benchmarkEvent) {
 func (w *eventWriter) close(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.flushLocked(ctx)
-	return w.firstErr
+	return w.flushLocked(ctx)
 }
 
-func (w *eventWriter) flushLocked(ctx context.Context) {
+func (w *eventWriter) flushLocked(ctx context.Context) error {
 	if len(w.pending) == 0 {
-		return
+		return w.firstErr
 	}
 	var body bytes.Buffer
 	encoder := json.NewEncoder(&body)
@@ -353,14 +454,14 @@ func (w *eventWriter) flushLocked(ctx context.Context) {
 		if err := encoder.Encode(event); err != nil {
 			w.recordError(err)
 			w.pending = nil
-			return
+			return err
 		}
 	}
 	endpoint, err := url.Parse(w.endpoint)
 	if err != nil {
 		w.recordError(err)
 		w.pending = nil
-		return
+		return err
 	}
 	query := endpoint.Query()
 	query.Set("db", "public")
@@ -383,7 +484,8 @@ func (w *eventWriter) flushLocked(ctx context.Context) {
 				resp.Body.Close()
 				if readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 					w.pending = nil
-					return
+					w.firstErr = nil
+					return nil
 				}
 				if readErr != nil {
 					lastErr = readErr
@@ -400,6 +502,7 @@ func (w *eventWriter) flushLocked(ctx context.Context) {
 	}
 	w.recordError(lastErr)
 	w.pending = nil
+	return lastErr
 }
 
 func (w *eventWriter) recordError(err error) {
@@ -416,21 +519,128 @@ type writeResult struct {
 	err          error
 }
 
-func periodicWorker(url, authorization, physicalTable string, requests <-chan prompb.WriteRequest, results chan<- writeResult, wg *sync.WaitGroup, dryRun bool) {
+// bytePacer reserves compressed remote-write payloads at a global target rate.
+// A single pacer is shared by all workers so --workers cannot multiply pressure.
+type bytePacer struct {
+	mu          sync.Mutex
+	targetBPS   float64
+	nextAllowed time.Time
+}
+
+// burstAmplifier raises config-derived passes only when the qualified traffic
+// cannot meet its target rate. The cap keeps a bad target from growing an
+// unbounded producer backlog.
+type burstAmplifier struct {
+	mu      sync.Mutex
+	current uint64
+	max     uint64
+}
+
+func newBurstAmplifier(initial uint64) *burstAmplifier {
+	return &burstAmplifier{current: initial, max: initial * 4}
+}
+
+func (a *burstAmplifier) value() uint64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.current
+}
+
+func (a *burstAmplifier) increase() (uint64, bool) {
+	if a == nil {
+		return 0, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current >= a.max {
+		return a.current, false
+	}
+	next := uint64(math.Ceil(float64(a.current) * 1.25))
+	if next <= a.current {
+		next = a.current + 1
+	}
+	a.current = min(next, a.max)
+	return a.current, true
+}
+
+func newBytePacer(targetBPS float64) *bytePacer {
+	if targetBPS <= 0 {
+		return nil
+	}
+	return &bytePacer{targetBPS: targetBPS}
+}
+
+func (p *bytePacer) target() float64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.targetBPS
+}
+
+func (p *bytePacer) increase(maxBPS float64) (float64, bool) {
+	if p == nil || maxBPS <= 0 {
+		return 0, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	previous := p.targetBPS
+	p.targetBPS = math.Min(maxBPS, p.targetBPS*1.25)
+	return p.targetBPS, p.targetBPS > previous
+}
+
+func (p *bytePacer) wait(ctx context.Context, payloadBytes int) error {
+	if p == nil || payloadBytes == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	now := time.Now()
+	start := p.nextAllowed
+	if start.Before(now) {
+		start = now
+	}
+	// Snapshot the rate while reserving, so later adaptive changes only affect
+	// payloads that have not yet entered the pacing queue.
+	p.nextAllowed = start.Add(time.Duration(float64(payloadBytes) / p.targetBPS * float64(time.Second)))
+	p.mu.Unlock()
+
+	if delay := time.Until(start); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func periodicWorker(ctx context.Context, url, authorization, physicalTable string, requests <-chan prompb.WriteRequest, results chan<- writeResult, wg *sync.WaitGroup, dryRun bool, pacer *bytePacer) {
 	defer wg.Done()
+	requester := benchhttp.NewRequester(url)
+	if authorization != "" {
+		requester.SetHeader("Authorization", authorization)
+	}
+	requester.SetHeader("x-greptime-hint-physical_table", physicalTable)
 	for request := range requests {
 		result := writeResult{requestCount: 1, sampleCount: sampleCount(request)}
 		started := time.Now()
 		if dryRun {
 			result.payloadBytes = 0
 		} else {
-			requester := benchhttp.NewRequester(url)
-			if authorization != "" {
-				requester.SetHeader("Authorization", authorization)
+			prepared, err := benchhttp.PrepareWriteRequest(request)
+			if err == nil {
+				result.payloadBytes = uint64(prepared.PayloadBytes())
+				err = pacer.wait(ctx, prepared.PayloadBytes())
 			}
-			requester.SetHeader("x-greptime-hint-physical_table", physicalTable)
-			stats, err := requester.SendWithStats(request)
-			result.payloadBytes = uint64(stats.PayloadBytes)
+			if err == nil {
+				err = requester.SendPrepared(ctx, prepared)
+			}
 			result.err = err
 		}
 		result.duration = time.Since(started)
@@ -504,10 +714,20 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 		logicalTable = logicalTables[0]
 	}
 	baseEvent := benchmarkEvent{RunID: runID, TargetDatabase: options.TargetDatabase, LogicalTable: logicalTable, PhysicalTable: options.TargetPhysicalTable, AutopilotExpect: options.AutopilotExpect, AutopilotConfigHash: options.AutopilotConfigHash, AutopilotConfigSnapshot: options.AutopilotConfigSnapshot, AnalysisContextIncomplete: options.AutopilotConfigSnapshot == ""}
-
 	var writer *eventWriter
 	var snapshots *regionSnapshotStore
 	var refresher *regionRefresher
+	emitLifecycle := func(name string, event benchmarkEvent, bundle *regionSnapshotBundle) {
+		if writer == nil {
+			return
+		}
+		if err := writer.emitWithSnapshotAndFlush(ctx, event, bundle); err != nil {
+			// Self-monitoring is diagnostic-only. Never make a telemetry ingestion
+			// outage stop the workload that it is meant to describe.
+			log.Printf("periodic-burst: write %s event: %v; continuing workload", name, err)
+		}
+	}
+
 	if !s.DryRun {
 		writer = newEventWriter(options)
 		snapshots = &regionSnapshotStore{}
@@ -551,8 +771,8 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 				event.Error = runErr.Error()
 			}), snapshots)
 		}
-		if closeErr := writer.close(finishContext); runErr == nil && closeErr != nil {
-			runErr = fmt.Errorf("flush benchmark events: %w", closeErr)
+		if closeErr := writer.close(finishContext); closeErr != nil {
+			log.Printf("periodic-burst: flush benchmark events: %v", closeErr)
 		}
 	}()
 
@@ -560,21 +780,14 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	churnEpochGenerator := samples.NewChurnEpochGenerator(s.ChurnInterval)
 	random, seed := newPeriodicRandom(options.RandomSeed)
 	firstBurstAt := time.Now().Add(jitterDuration(options.BaselineDuration, options.BurstJitter, random))
-	if writer != nil {
-		if err := writer.emitWithSnapshotAndFlush(ctx, eventWith(baseEvent, "run_started", "baseline", 0, func(event *benchmarkEvent) {
-			event.Details = fmt.Sprintf(`{"baseline_duration":"%s","baseline_tick_interval":"%s","burst_active_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"burst_count":%d,"random_seed":%d,"observe_interval":"%s","pressure_high_min_write_bps":%g,"configured_logical_tables":%s}`, options.BaselineDuration, options.BaselineTickInterval, options.BurstActiveDuration, options.BurstPeriod, options.BurstJitter, options.BurstAmplification, options.BurstCount, seed, options.ObserveInterval, options.PressureHighMinWriteBPS, mustJSON(logicalTables))
-		}), currentSnapshot(snapshots)); err != nil {
-			return fmt.Errorf("write run_started event: %w", err)
-		}
-	}
+	emitLifecycle("run_started", eventWith(baseEvent, "run_started", "baseline", 0, func(event *benchmarkEvent) {
+		event.Details = fmt.Sprintf(`{"baseline_duration":"%s","baseline_tick_interval":"%s","burst_active_duration":"%s","transient_burst_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"burst_count":%d,"random_seed":%d,"observe_interval":"%s","periodic_traffic_mode":%q,"burst_class":%q,"baseline_target_write_bps":%g,"qualified_max_write_bps":%g,"pressure_high_min_write_bps":%g,"configured_logical_tables":%s}`, options.BaselineDuration, options.BaselineTickInterval, options.BurstActiveDuration, options.TransientBurstDuration, options.BurstPeriod, options.BurstJitter, options.BurstAmplification, options.BurstCount, seed, options.ObserveInterval, options.TrafficMode, options.BurstClass, options.BaselineTargetWriteBPS, options.QualifiedMaxWriteBPS, options.PressureHighMinWriteBPS, mustJSON(logicalTables))
+	}), currentSnapshot(snapshots))
 	for cycle := uint64(1); options.BurstCount == 0 || cycle <= options.BurstCount; cycle++ {
+		class := nextBurstClass(options.BurstClass, random)
 		plannedTarget, targetOK := selectHotTarget(currentSnapshot(snapshots), random)
-		if writer != nil {
-			if err := writer.emitWithSnapshotAndFlush(ctx, plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, plannedTarget, targetOK), currentSnapshot(snapshots)); err != nil {
-				return fmt.Errorf("write pressure_scheduled event: %w", err)
-			}
-		}
-		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, firstBurstAt, options.BaselineTickInterval, "baseline", 0, options, writer, snapshots, baseEvent, nil); err != nil {
+		emitLifecycle("pressure_scheduled", plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, class, plannedTarget, targetOK), currentSnapshot(snapshots))
+		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, firstBurstAt, options.BaselineTickInterval, "baseline", 0, options, writer, snapshots, baseEvent, nil, burstClassTransient); err != nil {
 			return err
 		}
 		targetReselected := false
@@ -584,33 +797,31 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 			targetReselected = true
 		}
 		if writer != nil && targetReselected {
-			if err := writer.emitWithSnapshotAndFlush(ctx, eventWith(baseEvent, "pressure_target_reselected", "baseline", cycle, func(event *benchmarkEvent) {
+			emitLifecycle("pressure_target_reselected", eventWith(baseEvent, "pressure_target_reselected", "baseline", cycle, func(event *benchmarkEvent) {
 				event.RegionID = plannedTarget.regionID
 				event.Details = fmt.Sprintf(`{"reason":"partition_mapping_changed","previous_region_id":%d,"previous_label_name":%q,"previous_label_value":%q,"hot_label_name":%q,"hot_label_value":%q}`, previousTarget.regionID, previousTarget.labelName, previousTarget.labelValue, plannedTarget.labelName, plannedTarget.labelValue)
-			}), currentSnapshot(snapshots)); err != nil {
-				return fmt.Errorf("write pressure_target_reselected event: %w", err)
-			}
+			}), currentSnapshot(snapshots))
 		}
 		if writer != nil {
-			if err := writer.emitWithSnapshotAndFlush(ctx, eventWith(baseEvent, "pressure_started", "active", cycle, func(event *benchmarkEvent) {
+			emitLifecycle("pressure_started", eventWith(baseEvent, "pressure_started", "active", cycle, func(event *benchmarkEvent) {
 				now := time.Now()
 				event.ScheduledTSMS = firstBurstAt.UnixMilli()
 				event.ActualTSMS = now.UnixMilli()
-				event.PressureThresholdBPS = options.PressureHighMinWriteBPS
+				event.BurstClass = string(class)
+				event.AutopilotExpect = class.expectation(options.AutopilotExpect)
+				event.PressureThresholdBPS = floatEventValue(class.initialTargetBPS(options))
 				if targetOK {
 					event.RegionID = plannedTarget.regionID
-					event.Details = fmt.Sprintf(`{"hot_label_name":%q,"hot_label_value":%q}`, plannedTarget.labelName, plannedTarget.labelValue)
+					event.Details = fmt.Sprintf(`{"hot_label_name":%q,"hot_label_value":%q,"burst_class":%q,"target_write_bps":%g}`, plannedTarget.labelName, plannedTarget.labelValue, class, class.initialTargetBPS(options))
 				}
-			}), currentSnapshot(snapshots)); err != nil {
-				return fmt.Errorf("write pressure_started event: %w", err)
-			}
+			}), currentSnapshot(snapshots))
 		}
-		activeDeadline := time.Now().Add(options.BurstActiveDuration)
+		activeDeadline := time.Now().Add(class.duration(options))
 		var target *hotTarget
 		if targetOK {
 			target = &plannedTarget
 		}
-		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, activeDeadline, s.TickInterval, "active", cycle, options, writer, snapshots, baseEvent, target); err != nil {
+		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, activeDeadline, s.TickInterval, "active", cycle, options, writer, snapshots, baseEvent, target, class); err != nil {
 			return err
 		}
 		if writer != nil {
@@ -636,7 +847,9 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	return nil
 }
 
-func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, deadline time.Time, tickInterval time.Duration, phase string, cycle uint64, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, target *hotTarget) error {
+func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, deadline time.Time, tickInterval time.Duration, phase string, cycle uint64, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, target *hotTarget, class burstClass) error {
+	phaseCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	requests := make(chan prompb.WriteRequest, s.Workers)
 	results := make(chan writeResult, s.Workers*2)
 	collector := &workloadCollector{}
@@ -649,62 +862,105 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 	}()
 
 	var workers sync.WaitGroup
+	var pacer *bytePacer
+	var amplifier *burstAmplifier
+	if options.TrafficMode == "steady" {
+		targetBPS := options.BaselineTargetWriteBPS
+		if phase == "active" {
+			targetBPS = class.initialTargetBPS(options)
+		}
+		pacer = newBytePacer(targetBPS)
+		if phase == "active" && class == burstClassQualified {
+			amplifier = newBurstAmplifier(options.BurstAmplification)
+		}
+	}
 	for i := 0; i < s.Workers; i++ {
 		workers.Add(1)
-		go periodicWorker(s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, requests, results, &workers, s.DryRun)
+		go periodicWorker(ctx, s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, requests, results, &workers, s.DryRun, pacer)
 	}
 
 	started := time.Now()
-	tick := time.NewTicker(tickInterval)
+	windowInterval := workloadWindowInterval
+	if options.TrafficMode == "steady" {
+		// In steady mode the configured scrape cadence is also the observation
+		// window. This makes the recorded rate directly comparable to Prometheus.
+		windowInterval = tickInterval
+	}
 	window := time.NewTicker(workloadWindowInterval)
-	defer tick.Stop()
+	if windowInterval != workloadWindowInterval {
+		window.Stop()
+		window = time.NewTicker(windowInterval)
+	}
 	defer window.Stop()
 	windowStarted := started
 	consecutiveHigh := uint64(0)
-	generate := func() {
-		epoch := churn.GetChurnEpoch()
-		repetitions := uint64(1)
-		if target != nil {
-			repetitions = options.BurstAmplification
-		}
-		for range repetitions {
-			if target == nil {
-				s.convertToRemoteWriteRequestsStreaming(ctx, fileConfigs, *current, requests, epoch)
-			} else {
-				s.convertToRemoteWriteRequestsStreamingFiltered(ctx, fileConfigs, *current, requests, epoch, func(series prompb.TimeSeries) bool {
-					return matchesHotTarget(series, *target)
-				})
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		defer close(requests)
+		tick := time.NewTicker(tickInterval)
+		defer tick.Stop()
+		generate := func() {
+			epoch := churn.GetChurnEpoch()
+			repetitions := uint64(1)
+			if target != nil {
+				repetitions = options.BurstAmplification
+				if amplifier != nil {
+					repetitions = amplifier.value()
+				}
 			}
-			*current = current.Add(s.Interval)
+			for range repetitions {
+				if target == nil {
+					s.convertToRemoteWriteRequestsStreaming(phaseCtx, fileConfigs, *current, requests, epoch)
+				} else {
+					s.convertToRemoteWriteRequestsStreamingFiltered(phaseCtx, fileConfigs, *current, requests, epoch, func(series prompb.TimeSeries) bool {
+						return matchesHotTarget(series, *target)
+					})
+				}
+				if phaseCtx.Err() != nil {
+					return
+				}
+				*current = current.Add(s.Interval)
+			}
 		}
-	}
-	generate()
+		for {
+			generate()
+			select {
+			case <-phaseCtx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
 
-	for time.Now().Before(deadline) {
+	for {
 		select {
 		case <-ctx.Done():
-			close(requests)
+			cancel()
+			<-producerDone
 			workers.Wait()
 			close(results)
 			<-collectorDone
 			return ctx.Err()
-		case <-tick.C:
-			generate()
+		case <-phaseCtx.Done():
+			<-producerDone
+			workers.Wait()
+			close(results)
+			<-collectorDone
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			now := time.Now()
+			emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, pacer, amplifier, class, options.QualifiedMaxWriteBPS)
+			return nil
 		case now := <-window.C:
-			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh)
+			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, pacer, amplifier, class, options.QualifiedMaxWriteBPS)
 			windowStarted = now
 		}
 	}
-	close(requests)
-	workers.Wait()
-	close(results)
-	<-collectorDone
-	now := time.Now()
-	emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh)
-	return nil
 }
 
-func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, phase string, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64) uint64 {
+func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, phase string, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64, pacer *bytePacer, amplifier *burstAmplifier, class burstClass, qualifiedMaxWriteBPS float64) uint64 {
 	if writer == nil || !end.After(start) {
 		return consecutiveHigh
 	}
@@ -720,19 +976,23 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *reg
 		event.PayloadBytes = metrics.payloadBytes
 		event.SuccessCount = metrics.successCount
 		event.ErrorCount = metrics.errorCount
-		event.WriteBPS = writeBPS
-		event.LatencyP50MS = latencyPercentileMS(latencies, 0.50)
-		event.LatencyP95MS = latencyPercentileMS(latencies, 0.95)
-		event.LatencyMaxMS = latencyPercentileMS(latencies, 1)
-		event.PressureThresholdBPS = threshold
+		event.WriteBPS = floatEventValue(writeBPS)
+		event.LatencyP50MS = floatEventValue(latencyPercentileMS(latencies, 0.50))
+		event.LatencyP95MS = floatEventValue(latencyPercentileMS(latencies, 0.95))
+		event.LatencyMaxMS = floatEventValue(latencyPercentileMS(latencies, 1))
+		event.PressureThresholdBPS = floatEventValue(threshold)
+		event.BurstClass = string(class)
+		if target := pacer.target(); target > 0 {
+			event.Details = fmt.Sprintf(`{"target_write_bps":%g,"source_passes":%d}`, target, amplifier.value())
+		}
 	})
 	if writeBPS >= threshold && metrics.errorCount == 0 {
 		consecutiveHigh++
 	} else {
 		if consecutiveHigh >= 3 {
 			emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_dropped", phase, cycle, func(event *benchmarkEvent) {
-				event.WriteBPS = writeBPS
-				event.PressureThresholdBPS = threshold
+				event.WriteBPS = floatEventValue(writeBPS)
+				event.PressureThresholdBPS = floatEventValue(threshold)
 				event.ConsecutiveHighWindows = consecutiveHigh
 			}), snapshots)
 		}
@@ -750,10 +1010,21 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *reg
 	}
 	if consecutiveHigh == 3 {
 		emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_observed_high", phase, cycle, func(event *benchmarkEvent) {
-			event.WriteBPS = writeBPS
-			event.PressureThresholdBPS = threshold
+			event.WriteBPS = floatEventValue(writeBPS)
+			event.PressureThresholdBPS = floatEventValue(threshold)
 			event.ConsecutiveHighWindows = consecutiveHigh
 		}), snapshots)
+	}
+	if phase == "active" && class == burstClassQualified && metrics.errorCount == 0 && pacer != nil && writeBPS < pacer.target()*0.9 {
+		if target, increased := pacer.increase(qualifiedMaxWriteBPS); increased {
+			sourcePasses, _ := amplifier.increase()
+			emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_rate_adjusted", phase, cycle, func(event *benchmarkEvent) {
+				event.BurstClass = string(class)
+				event.WriteBPS = floatEventValue(writeBPS)
+				event.PressureThresholdBPS = floatEventValue(target)
+				event.Details = fmt.Sprintf(`{"reason":"observed_below_target","new_target_write_bps":%g,"max_target_write_bps":%g,"source_passes":%d}`, target, qualifiedMaxWriteBPS, sourcePasses)
+			}), snapshots)
+		}
 	}
 	return consecutiveHigh
 }
@@ -817,15 +1088,17 @@ func jitterDuration(duration time.Duration, jitter float64, random *mathrand.Ran
 	return time.Duration(float64(duration) * factor)
 }
 
-func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, options periodicOptions, seed int64, target hotTarget, targetOK bool) benchmarkEvent {
+func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, options periodicOptions, seed int64, class burstClass, target hotTarget, targetOK bool) benchmarkEvent {
 	return eventWith(base, "pressure_scheduled", "baseline", cycle, func(event *benchmarkEvent) {
 		event.ScheduledTSMS = scheduled.UnixMilli()
-		event.PressureThresholdBPS = options.PressureHighMinWriteBPS
+		event.BurstClass = string(class)
+		event.AutopilotExpect = class.expectation(options.AutopilotExpect)
+		event.PressureThresholdBPS = floatEventValue(class.initialTargetBPS(options))
 		if targetOK {
 			event.RegionID = target.regionID
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_active_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"hot_label_name":%q,"hot_label_value":%q}`, seed, options.BurstActiveDuration, options.BurstPeriod, options.BurstJitter, options.BurstAmplification, target.labelName, target.labelValue)
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_label_name":%q,"hot_label_value":%q}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), target.labelName, target.labelValue)
 		} else {
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_active_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"hot_target_unavailable":true}`, seed, options.BurstActiveDuration, options.BurstPeriod, options.BurstJitter, options.BurstAmplification)
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_target_unavailable":true}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options))
 		}
 	})
 }
@@ -1136,10 +1409,10 @@ func regionEvent(base benchmarkEvent, snapshot regionSnapshot, exists bool, prev
 	event.MemtableDecreased = snapshot.memtableSize < previous.memtableSize
 	event.CounterReset = snapshot.writtenBytesSinceOpen < previous.writtenBytesSinceOpen
 	if !event.CounterReset {
-		event.WrittenBytesBPS = float64(snapshot.writtenBytesSinceOpen-previous.writtenBytesSinceOpen) / elapsed.Seconds()
+		event.WrittenBytesBPS = floatEventValue(float64(snapshot.writtenBytesSinceOpen-previous.writtenBytesSinceOpen) / elapsed.Seconds())
 	}
 	if event.MemtableSizeDeltaBytes >= 0 {
-		event.MemtableWriteBPSApprox = float64(event.MemtableSizeDeltaBytes) / elapsed.Seconds()
+		event.MemtableWriteBPSApprox = floatEventValue(float64(event.MemtableSizeDeltaBytes) / elapsed.Seconds())
 	}
 	return event
 }

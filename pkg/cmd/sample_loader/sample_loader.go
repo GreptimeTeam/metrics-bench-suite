@@ -616,6 +616,7 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().String("baseline-duration", defaultBaselineDuration.String(), "Nominal low-pressure duration before the first randomized burst")
 	rootCmd.Flags().String("baseline-tick-interval", defaultBaselineTick.String(), "Remote-write interval during continuous low-pressure periods")
 	rootCmd.Flags().String("burst-active-duration", defaultBurstActive.String(), "Sustained remote-write duration in each burst")
+	rootCmd.Flags().String("transient-burst-duration", defaultTransientBurst.String(), "Short burst duration used for transient pressure probes")
 	rootCmd.Flags().String("burst-period", defaultBurstPeriod.String(), "Nominal start-to-start interval between randomized bursts")
 	rootCmd.Flags().Float64("burst-jitter", defaultBurstJitter, "Uniform random jitter fraction applied to burst scheduling (0-1)")
 	rootCmd.Flags().Uint64("burst-amplification", 4, "Number of config-derived hotspot passes per active tick")
@@ -627,6 +628,10 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().String("target-physical-table", "", "Physical table to observe in periodic-burst mode")
 	rootCmd.Flags().String("autopilot-expect", "", "Expected Enterprise automation: repartition, rebalance, or both")
 	rootCmd.Flags().Float64("pressure-high-min-write-bps", 0, "Minimum sustained payload bytes per second considered high pressure")
+	rootCmd.Flags().String("periodic-traffic-mode", "legacy", "Periodic traffic controller: legacy or steady (global payload-byte pacing)")
+	rootCmd.Flags().String("burst-class", "", "Burst class: mixed, transient, or qualified; steady mode defaults to mixed")
+	rootCmd.Flags().Float64("baseline-target-write-bps", 0, "Steady-mode baseline target bytes/sec; zero derives one quarter of pressure-high-min-write-bps")
+	rootCmd.Flags().Float64("qualified-max-write-bps", 0, "Steady-mode qualified burst ceiling bytes/sec; zero derives three times pressure-high-min-write-bps")
 	rootCmd.Flags().String("self-monitoring-url", "", "GreptimeDB self-monitoring HTTP endpoint used to ingest benchmark events")
 	rootCmd.Flags().String("autopilot-config-file", "", "Path to the effective Enterprise autopilot configuration snapshot")
 
