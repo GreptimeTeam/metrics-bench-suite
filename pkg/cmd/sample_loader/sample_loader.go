@@ -618,6 +618,7 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().String("burst-active-duration", defaultBurstActive.String(), "Sustained remote-write duration in each burst")
 	rootCmd.Flags().String("transient-burst-duration", defaultTransientBurst.String(), "Short burst duration used for transient pressure probes")
 	rootCmd.Flags().String("burst-period", defaultBurstPeriod.String(), "Nominal start-to-start interval between randomized bursts")
+	rootCmd.Flags().String("burst-gap", defaultBurstGap.String(), "Steady-mode quiet interval after an active burst before the next burst")
 	rootCmd.Flags().Float64("burst-jitter", defaultBurstJitter, "Uniform random jitter fraction applied to burst scheduling (0-1)")
 	rootCmd.Flags().Uint64("burst-amplification", 4, "Number of config-derived hotspot passes per active tick")
 	rootCmd.Flags().Uint64("burst-count", 0, "Number of periodic bursts; zero runs indefinitely")

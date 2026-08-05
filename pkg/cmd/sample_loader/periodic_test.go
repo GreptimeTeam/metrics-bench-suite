@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	mathrand "math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -69,7 +70,7 @@ func TestSteadyTrafficDefaultsToMixedBursts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.BurstClass != burstClassMixed || options.BaselineTargetWriteBPS != 2 || options.QualifiedMaxWriteBPS != 24 {
+	if options.BurstClass != burstClassMixed || options.BaselineTargetWriteBPS != 2 || options.QualifiedMaxWriteBPS != 24 || options.BurstGap != defaultBurstGap {
 		t.Fatalf("unexpected steady defaults: %#v", options)
 	}
 }
@@ -219,16 +220,20 @@ func TestSeededBurstScheduleIsDeterministic(t *testing.T) {
 func TestMixedBurstClassesAreSeededAndContainBothCategories(t *testing.T) {
 	first, _ := newPeriodicRandom(42)
 	second, _ := newPeriodicRandom(42)
-	seen := map[burstClass]bool{}
-	for range 16 {
-		got := nextBurstClass(burstClassMixed, first)
-		if got != nextBurstClass(burstClassMixed, second) {
+	firstScheduler := newBurstClassScheduler(burstClassMixed, first)
+	secondScheduler := newBurstClassScheduler(burstClassMixed, second)
+	for range 8 {
+		firstClass := firstScheduler.next()
+		if firstClass != secondScheduler.next() {
 			t.Fatal("mixed schedule must be deterministic with a seed")
 		}
-		seen[got] = true
-	}
-	if !seen[burstClassTransient] || !seen[burstClassQualified] {
-		t.Fatalf("mixed schedule did not cover both classes: %#v", seen)
+		secondClass := firstScheduler.next()
+		if secondClass != secondScheduler.next() {
+			t.Fatal("mixed schedule must be deterministic with a seed")
+		}
+		if firstClass == secondClass {
+			t.Fatalf("mixed scheduler must pair transient and qualified bursts, got %q then %q", firstClass, secondClass)
+		}
 	}
 }
 
@@ -242,6 +247,24 @@ func TestBurstClassDefinesExpectationAndTarget(t *testing.T) {
 	}
 	if got := burstClassTransient.duration(options); got != 5*time.Minute {
 		t.Fatalf("transient duration = %s", got)
+	}
+}
+
+func TestSteadyBurstGapStartsAfterActivePhase(t *testing.T) {
+	previousStart := time.Unix(100, 0)
+	activeFinished := time.Unix(200, 0)
+	options := periodicOptions{TrafficMode: "steady", BurstGap: 15 * time.Minute, BurstPeriod: time.Hour, BaselineTickInterval: time.Minute}
+	if got, want := nextBurstStart(options, previousStart, activeFinished, mathrand.New(mathrand.NewSource(1))), activeFinished.Add(15*time.Minute); !got.Equal(want) {
+		t.Fatalf("steady next burst = %s, want %s", got, want)
+	}
+}
+
+func TestLegacyBurstPeriodStillUsesStartToStartScheduling(t *testing.T) {
+	previousStart := time.Unix(100, 0)
+	activeFinished := time.Unix(150, 0)
+	options := periodicOptions{TrafficMode: "legacy", BurstPeriod: time.Hour, BurstJitter: 0, BaselineTickInterval: time.Minute}
+	if got, want := nextBurstStart(options, previousStart, activeFinished, mathrand.New(mathrand.NewSource(1))), previousStart.Add(time.Hour); !got.Equal(want) {
+		t.Fatalf("legacy next burst = %s, want %s", got, want)
 	}
 }
 
