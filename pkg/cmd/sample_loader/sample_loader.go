@@ -507,6 +507,10 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(ctx context.Context, file
 }
 
 func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) bool {
+	return s.convertToRemoteWriteRequestsStreamingFiltered(ctx, fileConfigs, currentTime, requestChan, churnEpoch, nil)
+}
+
+func (s *SampleLoader) convertToRemoteWriteRequestsStreamingFiltered(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64, filter func(prompb.TimeSeries) bool) bool {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -520,6 +524,9 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context
 			tsChan := s.generateTimeSeriesForFileConfig(ctx, fc, currentTime, churnEpoch)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
+				if filter != nil && !filter(ts) {
+					continue
+				}
 				select {
 				case timeSeriesChan <- ts:
 				case <-ctx.Done():
@@ -606,10 +613,14 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().Float64("churn-rate", 0.0, "The rate of time series to churn (0.0-1.0, e.g., 0.01 = 1%)")
 	rootCmd.Flags().String("churn-interval", "0s", "The interval at which churn occurs (e.g., 10m)")
 	rootCmd.Flags().String("load-profile", "continuous", "Load profile: continuous or periodic-burst")
-	rootCmd.Flags().String("baseline-duration", defaultBaselineDuration.String(), "Observation-only duration before periodic bursts")
+	rootCmd.Flags().String("baseline-duration", defaultBaselineDuration.String(), "Nominal low-pressure duration before the first randomized burst")
+	rootCmd.Flags().String("baseline-tick-interval", defaultBaselineTick.String(), "Remote-write interval during continuous low-pressure periods")
 	rootCmd.Flags().String("burst-active-duration", defaultBurstActive.String(), "Sustained remote-write duration in each burst")
-	rootCmd.Flags().String("burst-period", defaultBurstPeriod.String(), "Total duration of each periodic burst")
+	rootCmd.Flags().String("burst-period", defaultBurstPeriod.String(), "Nominal start-to-start interval between randomized bursts")
+	rootCmd.Flags().Float64("burst-jitter", defaultBurstJitter, "Uniform random jitter fraction applied to burst scheduling (0-1)")
+	rootCmd.Flags().Uint64("burst-amplification", 4, "Number of config-derived hotspot passes per active tick")
 	rootCmd.Flags().Uint64("burst-count", 0, "Number of periodic bursts; zero runs indefinitely")
+	rootCmd.Flags().Int64("random-seed", 0, "Random scheduling seed; zero selects a random seed and records it in self-monitoring")
 	rootCmd.Flags().String("observe-interval", defaultObserveInterval.String(), "Region statistics observation interval")
 	rootCmd.Flags().String("observe-sql-url", "", "HTTP SQL endpoint; defaults to the remote-write endpoint origin")
 	rootCmd.Flags().String("target-database", "public", "Database containing the target physical table")
