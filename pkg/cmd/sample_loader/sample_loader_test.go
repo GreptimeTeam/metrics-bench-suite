@@ -1,9 +1,20 @@
 package sampleloader
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"log"
 	"metrics-bench-suite/pkg/samples"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +38,80 @@ func TestAuthorizationHeaderEmpty(t *testing.T) {
 
 	if got := s.authorizationHeader(); got != "" {
 		t.Fatalf("expected empty authorization header, got %q", got)
+	}
+}
+
+func TestParseRemoteWriteVersion(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected remoteWriteVersion
+	}{
+		{input: "v1", expected: remoteWriteV1},
+		{input: "v2", expected: remoteWriteV2},
+	}
+
+	for _, test := range tests {
+		got, err := parseRemoteWriteVersion(test.input)
+		if err != nil {
+			t.Fatalf("parse %q: %v", test.input, err)
+		}
+		if got != test.expected {
+			t.Fatalf("parse %q: expected %d, got %d", test.input, test.expected, got)
+		}
+	}
+
+	if _, err := parseRemoteWriteVersion("v3"); err == nil {
+		t.Fatal("expected unsupported version error")
+	}
+}
+
+func TestConvertToRemoteWriteV2Request(t *testing.T) {
+	request := prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "cpu_usage"},
+					{Name: "instance", Value: "a"},
+				},
+				Samples: []prompb.Sample{
+					{Value: 1, Timestamp: 2},
+					{Value: 3, Timestamp: 4},
+				},
+			},
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "cpu_usage"},
+					{Name: "instance", Value: "b"},
+				},
+				Samples: []prompb.Sample{{Value: 5, Timestamp: 6}},
+			},
+		},
+	}
+
+	got := convertToRemoteWriteV2Request(request)
+	expectedSymbols := []string{"", "__name__", "cpu_usage", "instance", "a", "b"}
+	if !reflect.DeepEqual(got.Symbols, expectedSymbols) {
+		t.Fatalf("expected symbols %v, got %v", expectedSymbols, got.Symbols)
+	}
+	if got.Symbols[0] != "" {
+		t.Fatalf("expected empty first symbol, got %q", got.Symbols[0])
+	}
+
+	expectedLabelRefs := [][]uint32{{1, 2, 3, 4}, {1, 2, 3, 5}}
+	for i := range got.Timeseries {
+		if !reflect.DeepEqual(got.Timeseries[i].LabelsRefs, expectedLabelRefs[i]) {
+			t.Fatalf("series %d: expected label refs %v, got %v", i, expectedLabelRefs[i], got.Timeseries[i].LabelsRefs)
+		}
+		if len(got.Timeseries[i].Samples) != len(request.Timeseries[i].Samples) {
+			t.Fatalf("series %d: expected %d samples, got %d", i, len(request.Timeseries[i].Samples), len(got.Timeseries[i].Samples))
+		}
+		for j := range got.Timeseries[i].Samples {
+			expected := request.Timeseries[i].Samples[j]
+			actual := got.Timeseries[i].Samples[j]
+			if actual.Value != expected.Value || actual.Timestamp != expected.Timestamp {
+				t.Fatalf("series %d sample %d: expected %+v, got %+v", i, j, expected, actual)
+			}
+		}
 	}
 }
 
@@ -245,7 +330,7 @@ func TestGenerateTimeSeriesForFileConfig(t *testing.T) {
 
 	t.Run("generateTimeSeries", func(t *testing.T) {
 		currentTime := time.Now()
-		timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
+		timeSeriesChan := s.generateTimeSeriesForFileConfig(context.Background(), &fileConfig, currentTime, 0)
 
 		// Collect all time series
 		timeSeries := make([]prompb.TimeSeries, 0)
@@ -293,6 +378,179 @@ func TestNewCommandDoesNotExposeDatabaseFlag(t *testing.T) {
 	cmd := NewCommand()
 	if flag := cmd.Flags().Lookup("database"); flag != nil {
 		t.Fatalf("expected no database flag, got %q", flag.Name)
+	}
+}
+
+func TestRunWithDurationStops(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	configPath := filepath.Join(t.TempDir(), "test.yaml")
+	config := []byte(`tags:
+  - name: instance
+    type: string
+    dist:
+      type: constant_string
+      value: test
+fields:
+  - name: value
+    type: float
+    dist:
+      type: uniform
+      lower_bound: 0
+      upper_bound: 1
+`)
+	if err := os.WriteFile(configPath, config, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"config":               configPath,
+		"dry-run":              "true",
+		"duration":             "20ms",
+		"interval":             "1s",
+		"remote-write-version": "v2",
+		"tick-interval":        "50ms",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
+	}
+
+	start := time.Now()
+	if err := (&SampleLoader{}).run(cmd, nil); err != nil {
+		t.Fatalf("run loader: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("duration run took too long: %s", elapsed)
+	}
+	for _, expected := range []string{
+		"Run statistics:",
+		`requests_total:\s+1`,
+		`requests_succeeded:\s+1`,
+		`requests_failed:\s+0`,
+		`samples_total:\s+1`,
+		`samples_in_succeeded_requests:\s+1`,
+		`samples_in_failed_requests:\s+0`,
+		`dry_run:\s+true`,
+	} {
+		if !regexp.MustCompile(expected).MatchString(logs.String()) {
+			t.Fatalf("expected log output to contain %q, got:\n%s", expected, logs.String())
+		}
+	}
+}
+
+func TestDurationStopsBlockedGeneration(t *testing.T) {
+	preset := make([]samples.PresetItem, 100)
+	for i := range preset {
+		preset[i] = samples.PresetItem{Value: fmt.Sprintf("instance-%d", i), Weight: 1}
+	}
+	fileConfigs := []samples.FileConfig{{
+		Name: "test_metric",
+		Config: samples.Config{
+			Tags: []samples.Tag{{
+				Name: "instance",
+				Dist: samples.Distribution{Type: "weighted_preset", Preset: preset},
+			}},
+			Fields: []samples.Field{{
+				Name: "value",
+				Dist: samples.Distribution{Type: "constant_float", Value: 1.0},
+			}},
+		},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() {
+		done <- (&SampleLoader{MaxSamples: 1}).convertToRemoteWriteRequestsStreaming(
+			ctx,
+			fileConfigs,
+			time.Now(),
+			make(chan prompb.WriteRequest),
+			0,
+		)
+	}()
+
+	select {
+	case completed := <-done:
+		if completed {
+			t.Fatal("expected generation to stop at the deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("generation did not stop at the deadline")
+	}
+}
+
+func TestWorkerCancelsAfterDrainTimeout(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	requestChan := make(chan prompb.WriteRequest, 1)
+	requestChan <- prompb.WriteRequest{}
+	close(requestChan)
+
+	var (
+		wg    sync.WaitGroup
+		stats runStats
+	)
+	wg.Add(1)
+	go worker(requestCtx, 0, server.URL, "", remoteWriteV1, requestChan, &wg, false, &stats)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start its request")
+	}
+
+	waitForWorkers(&wg, cancelRequests, 20*time.Millisecond)
+	if stats.failedRequests != 1 {
+		t.Fatalf("expected the canceled request to fail, got %+v", stats)
+	}
+}
+
+func TestRunRejectsNonPositiveDuration(t *testing.T) {
+	for _, duration := range []string{"0s", "-5s"} {
+		cmd := NewCommand()
+		if err := cmd.Flags().Set("dry-run", "true"); err != nil {
+			t.Fatalf("set dry-run: %v", err)
+		}
+		if err := cmd.Flags().Set("duration", duration); err != nil {
+			t.Fatalf("set duration: %v", err)
+		}
+		err := (&SampleLoader{}).run(cmd, nil)
+		if err == nil || !strings.Contains(err.Error(), "duration must be greater than zero") {
+			t.Fatalf("duration %q: expected non-positive duration error, got %v", duration, err)
+		}
+	}
+}
+
+func TestRunRejectsDurationWithInfinite(t *testing.T) {
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"dry-run":  "true",
+		"duration": "60s",
+		"infinite": "true",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
+	}
+
+	err := (&SampleLoader{}).run(cmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Fatalf("expected incompatible flags error, got %v", err)
 	}
 }
 
@@ -346,7 +604,7 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 	}
 
 	currentTime := time.Now()
-	timeSeriesChan := s.generateTimeSeriesForFileConfig(&fileConfig, currentTime, 0)
+	timeSeriesChan := s.generateTimeSeriesForFileConfig(context.Background(), &fileConfig, currentTime, 0)
 
 	var timeSeries []prompb.TimeSeries
 	for ts := range timeSeriesChan {

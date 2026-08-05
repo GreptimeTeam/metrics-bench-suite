@@ -14,6 +14,13 @@ type SeriesWithIndex struct {
 
 // TagSetPermutationStream calls fn for each label permutation (combination of label values).
 func TagSetPermutationStream(labels []LabelCandidates, fn func(SeriesWithIndex)) {
+	tagSetPermutationStream(labels, func(series SeriesWithIndex) bool {
+		fn(series)
+		return true
+	})
+}
+
+func tagSetPermutationStream(labels []LabelCandidates, fn func(SeriesWithIndex) bool) {
 	if len(labels) == 0 {
 		fn(SeriesWithIndex{
 			Series: make([]LabelPair, 0),
@@ -36,10 +43,12 @@ func TagSetPermutationStream(labels []LabelCandidates, fn func(SeriesWithIndex))
 				Value: label.Values[currentIndices[i]],
 			})
 		}
-		fn(SeriesWithIndex{
+		if !fn(SeriesWithIndex{
 			Series: series,
 			Index:  append([]int(nil), currentIndices...),
-		})
+		}) {
+			return
+		}
 
 		i := 0
 		for i < len(currentIndices) {
