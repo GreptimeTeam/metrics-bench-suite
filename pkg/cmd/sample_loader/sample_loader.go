@@ -507,10 +507,17 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(ctx context.Context, file
 }
 
 func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) bool {
-	return s.convertToRemoteWriteRequestsStreamingFiltered(ctx, fileConfigs, currentTime, requestChan, churnEpoch, nil)
+	return s.convertToRemoteWriteRequestsStreamingWithLabelValues(ctx, fileConfigs, currentTime, requestChan, churnEpoch, nil, nil)
 }
 
 func (s *SampleLoader) convertToRemoteWriteRequestsStreamingFiltered(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64, filter func(prompb.TimeSeries) bool) bool {
+	return s.convertToRemoteWriteRequestsStreamingWithLabelValues(ctx, fileConfigs, currentTime, requestChan, churnEpoch, nil, filter)
+}
+
+// convertToRemoteWriteRequestsStreamingWithLabelValues constrains generation
+// before the permutation stream is built. This keeps a hotspot burst from
+// repeatedly generating and discarding every non-target series.
+func (s *SampleLoader) convertToRemoteWriteRequestsStreamingWithLabelValues(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64, labelValues map[string]string, filter func(prompb.TimeSeries) bool) bool {
 	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
 
@@ -520,8 +527,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreamingFiltered(ctx context
 		wg.Add(1)
 		go func(fc *samples.FileConfig) {
 			defer wg.Done()
-			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(ctx, fc, currentTime, churnEpoch)
+			tsChan := s.generateTimeSeriesForFileConfigWithLabelValues(ctx, fc, currentTime, churnEpoch, labelValues)
 			// Forward all time series to the main channel
 			for ts := range tsChan {
 				if filter != nil && !filter(ts) {
@@ -578,6 +584,18 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreamingFiltered(ctx context
 		return enqueue(tsSet)
 	}
 	return true
+}
+
+func (s *SampleLoader) generateTimeSeriesForFileConfigWithLabelValues(ctx context.Context, fileConfig *samples.FileConfig, currentTime time.Time, churnEpoch int64, labelValues map[string]string) <-chan prompb.TimeSeries {
+	if len(labelValues) == 0 {
+		return s.generateTimeSeriesForFileConfig(ctx, fileConfig, currentTime, churnEpoch)
+	}
+	timeSeriesChan := make(chan prompb.TimeSeries, 1)
+	go func() {
+		defer close(timeSeriesChan)
+		fileConfig.GeneratePermutedTimeSeriesWithLabelValuesContext(ctx, currentTime, churnEpoch, s.Replica, labelValues, timeSeriesChan)
+	}()
+	return timeSeriesChan
 }
 
 // NewCommand creates the sample loader command.

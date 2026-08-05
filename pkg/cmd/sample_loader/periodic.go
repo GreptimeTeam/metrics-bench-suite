@@ -540,11 +540,25 @@ func (w *eventWriter) recordError(err error) {
 }
 
 type writeResult struct {
+	lane         trafficLane
 	duration     time.Duration
 	requestCount uint64
 	sampleCount  uint64
 	payloadBytes uint64
 	err          error
+}
+
+type trafficLane string
+
+const (
+	baselineTrafficLane trafficLane = "baseline"
+	hotspotTrafficLane  trafficLane = "hotspot"
+)
+
+type periodicWriteRequest struct {
+	request prompb.WriteRequest
+	lane    trafficLane
+	pacer   *bytePacer
 }
 
 // bytePacer reserves compressed remote-write payloads at a global target rate.
@@ -565,7 +579,11 @@ type burstAmplifier struct {
 }
 
 func newBurstAmplifier(initial uint64) *burstAmplifier {
-	return &burstAmplifier{current: initial, max: initial * 4}
+	// A partition value can represent only a small part of the sample-loader
+	// configuration. Keep increasing its passes long enough for a qualified
+	// burst to reach the configured pressure threshold instead of capping it at
+	// a small multiple of the initial value.
+	return &burstAmplifier{current: initial, max: max(initial*4, 256)}
 }
 
 func (a *burstAmplifier) value() uint64 {
@@ -648,23 +666,23 @@ func (p *bytePacer) wait(ctx context.Context, payloadBytes int) error {
 	return nil
 }
 
-func periodicWorker(ctx context.Context, url, authorization, physicalTable string, requests <-chan prompb.WriteRequest, results chan<- writeResult, wg *sync.WaitGroup, dryRun bool, pacer *bytePacer) {
+func periodicWorker(ctx context.Context, url, authorization, physicalTable string, requests <-chan periodicWriteRequest, results chan<- writeResult, wg *sync.WaitGroup, dryRun bool) {
 	defer wg.Done()
 	requester := benchhttp.NewRequester(url)
 	if authorization != "" {
 		requester.SetHeader("Authorization", authorization)
 	}
 	requester.SetHeader("x-greptime-hint-physical_table", physicalTable)
-	for request := range requests {
-		result := writeResult{requestCount: 1, sampleCount: sampleCount(request)}
+	for queued := range requests {
+		result := writeResult{lane: queued.lane, requestCount: 1, sampleCount: sampleCount(queued.request)}
 		started := time.Now()
 		if dryRun {
 			result.payloadBytes = 0
 		} else {
-			prepared, err := benchhttp.PrepareWriteRequest(request)
+			prepared, err := benchhttp.PrepareWriteRequest(queued.request)
 			if err == nil {
 				result.payloadBytes = uint64(prepared.PayloadBytes())
-				err = pacer.wait(ctx, prepared.PayloadBytes())
+				err = queued.pacer.wait(ctx, prepared.PayloadBytes())
 			}
 			if err == nil {
 				err = requester.SendPrepared(ctx, prepared)
@@ -684,6 +702,25 @@ func sampleCount(request prompb.WriteRequest) uint64 {
 	return count
 }
 
+func enqueuePeriodicRequests(ctx context.Context, requests chan<- periodicWriteRequest, lane trafficLane, pacer *bytePacer, produce func(chan<- prompb.WriteRequest) bool) bool {
+	raw := make(chan prompb.WriteRequest)
+	produced := make(chan bool, 1)
+	go func() {
+		produced <- produce(raw)
+		close(raw)
+	}()
+	for request := range raw {
+		select {
+		case requests <- periodicWriteRequest{request: request, lane: lane, pacer: pacer}:
+		case <-ctx.Done():
+			for range raw {
+			}
+			return false
+		}
+	}
+	return <-produced
+}
+
 type workloadMetrics struct {
 	requestCount uint64
 	sampleCount  uint64
@@ -692,6 +729,16 @@ type workloadMetrics struct {
 	errorCount   uint64
 	latencies    []time.Duration
 	lastError    string
+	baseline     trafficMetrics
+	hotspot      trafficMetrics
+}
+
+type trafficMetrics struct {
+	requestCount uint64
+	sampleCount  uint64
+	payloadBytes uint64
+	successCount uint64
+	errorCount   uint64
 }
 
 type workloadCollector struct {
@@ -712,6 +759,18 @@ func (c *workloadCollector) add(result writeResult) {
 		c.metrics.successCount++
 	}
 	c.metrics.latencies = append(c.metrics.latencies, result.duration)
+	lane := &c.metrics.baseline
+	if result.lane == hotspotTrafficLane {
+		lane = &c.metrics.hotspot
+	}
+	lane.requestCount += result.requestCount
+	lane.sampleCount += result.sampleCount
+	lane.payloadBytes += result.payloadBytes
+	if result.err != nil {
+		lane.errorCount++
+	} else {
+		lane.successCount++
+	}
 }
 
 func (c *workloadCollector) reset() workloadMetrics {
@@ -815,7 +874,7 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	for cycle := uint64(1); options.BurstCount == 0 || cycle <= options.BurstCount; cycle++ {
 		class := classScheduler.next()
 		plannedTarget, targetOK := selectHotTarget(currentSnapshot(snapshots), random)
-		emitLifecycle("pressure_scheduled", plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, class, plannedTarget, targetOK), currentSnapshot(snapshots))
+		emitLifecycle("pressure_scheduled", plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, class, plannedTarget, targetOK, currentSnapshot(snapshots)), currentSnapshot(snapshots))
 		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, firstBurstAt, options.BaselineTickInterval, "baseline", 0, options, writer, snapshots, baseEvent, nil, burstClassTransient); err != nil {
 			return err
 		}
@@ -887,7 +946,7 @@ func nextBurstStart(options periodicOptions, previousStart, activeFinished time.
 func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, deadline time.Time, tickInterval time.Duration, phase string, cycle uint64, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, target *hotTarget, class burstClass) error {
 	phaseCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	requests := make(chan prompb.WriteRequest, s.Workers)
+	requests := make(chan periodicWriteRequest, s.Workers)
 	results := make(chan writeResult, s.Workers*2)
 	collector := &workloadCollector{}
 	collectorDone := make(chan struct{})
@@ -899,21 +958,19 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 	}()
 
 	var workers sync.WaitGroup
-	var pacer *bytePacer
+	var baselinePacer *bytePacer
+	var hotspotPacer *bytePacer
 	var amplifier *burstAmplifier
 	if options.TrafficMode == "steady" {
-		targetBPS := options.BaselineTargetWriteBPS
-		if phase == "active" {
-			targetBPS = class.initialTargetBPS(options)
-		}
-		pacer = newBytePacer(targetBPS)
-		if phase == "active" && class == burstClassQualified {
+		baselinePacer = newBytePacer(options.BaselineTargetWriteBPS)
+		if phase == "active" && target != nil && class == burstClassQualified {
+			hotspotPacer = newBytePacer(max(class.initialTargetBPS(options)-options.BaselineTargetWriteBPS, 0))
 			amplifier = newBurstAmplifier(options.BurstAmplification)
 		}
 	}
 	for i := 0; i < s.Workers; i++ {
 		workers.Add(1)
-		go periodicWorker(ctx, s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, requests, results, &workers, s.DryRun, pacer)
+		go periodicWorker(ctx, s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, requests, results, &workers, s.DryRun)
 	}
 
 	started := time.Now()
@@ -939,22 +996,50 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 		defer tick.Stop()
 		generate := func() {
 			epoch := churn.GetChurnEpoch()
-			repetitions := uint64(1)
-			if target != nil {
-				repetitions = options.BurstAmplification
-				if amplifier != nil {
-					repetitions = amplifier.value()
+			if options.TrafficMode != "steady" {
+				repetitions := uint64(1)
+				if target != nil {
+					repetitions = options.BurstAmplification
 				}
+				for range repetitions {
+					if !enqueuePeriodicRequests(phaseCtx, requests, baselineTrafficLane, nil, func(raw chan<- prompb.WriteRequest) bool {
+						if target == nil {
+							return s.convertToRemoteWriteRequestsStreaming(phaseCtx, fileConfigs, *current, raw, epoch)
+						}
+						return s.convertToRemoteWriteRequestsStreamingFiltered(phaseCtx, fileConfigs, *current, raw, epoch, func(series prompb.TimeSeries) bool {
+							return matchesHotTarget(series, *target)
+						})
+					}) {
+						return
+					}
+					*current = current.Add(s.Interval)
+				}
+				return
 			}
+			if target == nil {
+				enqueuePeriodicRequests(phaseCtx, requests, baselineTrafficLane, baselinePacer, func(raw chan<- prompb.WriteRequest) bool {
+					return s.convertToRemoteWriteRequestsStreaming(phaseCtx, fileConfigs, *current, raw, epoch)
+				})
+				*current = current.Add(s.Interval)
+				return
+			}
+
+			// A steady active phase keeps the normal config-derived baseline and
+			// adds only the selected partition value as extra traffic.
+			if !enqueuePeriodicRequests(phaseCtx, requests, baselineTrafficLane, baselinePacer, func(raw chan<- prompb.WriteRequest) bool {
+				return s.convertToRemoteWriteRequestsStreaming(phaseCtx, fileConfigs, *current, raw, epoch)
+			}) {
+				return
+			}
+			*current = current.Add(s.Interval)
+			if hotspotPacer == nil {
+				return
+			}
+			repetitions := amplifier.value()
 			for range repetitions {
-				if target == nil {
-					s.convertToRemoteWriteRequestsStreaming(phaseCtx, fileConfigs, *current, requests, epoch)
-				} else {
-					s.convertToRemoteWriteRequestsStreamingFiltered(phaseCtx, fileConfigs, *current, requests, epoch, func(series prompb.TimeSeries) bool {
-						return matchesHotTarget(series, *target)
-					})
-				}
-				if phaseCtx.Err() != nil {
+				if !enqueuePeriodicRequests(phaseCtx, requests, hotspotTrafficLane, hotspotPacer, func(raw chan<- prompb.WriteRequest) bool {
+					return s.convertToRemoteWriteRequestsStreamingWithLabelValues(phaseCtx, fileConfigs, *current, raw, epoch, map[string]string{target.labelName: target.labelValue}, nil)
+				}) {
 					return
 				}
 				*current = current.Add(s.Interval)
@@ -988,16 +1073,16 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 				return err
 			}
 			now := time.Now()
-			emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, pacer, amplifier, class, options.QualifiedMaxWriteBPS)
+			emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, baselinePacer, hotspotPacer, amplifier, class, options.QualifiedMaxWriteBPS)
 			return nil
 		case now := <-window.C:
-			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, pacer, amplifier, class, options.QualifiedMaxWriteBPS)
+			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, baselinePacer, hotspotPacer, amplifier, class, options.QualifiedMaxWriteBPS)
 			windowStarted = now
 		}
 	}
 }
 
-func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, phase string, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64, pacer *bytePacer, amplifier *burstAmplifier, class burstClass, qualifiedMaxWriteBPS float64) uint64 {
+func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, phase string, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64, baselinePacer, hotspotPacer *bytePacer, amplifier *burstAmplifier, class burstClass, qualifiedMaxWriteBPS float64) uint64 {
 	if writer == nil || !end.After(start) {
 		return consecutiveHigh
 	}
@@ -1019,8 +1104,10 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *reg
 		event.LatencyMaxMS = floatEventValue(latencyPercentileMS(latencies, 1))
 		event.PressureThresholdBPS = floatEventValue(threshold)
 		event.BurstClass = string(class)
-		if target := pacer.target(); target > 0 {
-			event.Details = fmt.Sprintf(`{"target_write_bps":%g,"source_passes":%d}`, target, amplifier.value())
+		baselineTarget := baselinePacer.target()
+		hotspotTarget := hotspotPacer.target()
+		if baselineTarget > 0 || hotspotTarget > 0 {
+			event.Details = fmt.Sprintf(`{"target_write_bps":%g,"baseline_target_write_bps":%g,"hotspot_target_write_bps":%g,"baseline_write_bps":%g,"hotspot_write_bps":%g,"source_passes":%d}`, baselineTarget+hotspotTarget, baselineTarget, hotspotTarget, float64(metrics.baseline.payloadBytes)/duration.Seconds(), float64(metrics.hotspot.payloadBytes)/duration.Seconds(), amplifier.value())
 		}
 	})
 	if writeBPS >= threshold && metrics.errorCount == 0 {
@@ -1052,14 +1139,14 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *reg
 			event.ConsecutiveHighWindows = consecutiveHigh
 		}), snapshots)
 	}
-	if phase == "active" && class == burstClassQualified && metrics.errorCount == 0 && pacer != nil && writeBPS < pacer.target()*0.9 {
-		if target, increased := pacer.increase(qualifiedMaxWriteBPS); increased {
+	if phase == "active" && class == burstClassQualified && metrics.errorCount == 0 && hotspotPacer != nil && writeBPS < (baselinePacer.target()+hotspotPacer.target())*0.9 {
+		if hotspotTarget, increased := hotspotPacer.increase(max(qualifiedMaxWriteBPS-baselinePacer.target(), 0)); increased {
 			sourcePasses, _ := amplifier.increase()
 			emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_rate_adjusted", phase, cycle, func(event *benchmarkEvent) {
 				event.BurstClass = string(class)
 				event.WriteBPS = floatEventValue(writeBPS)
-				event.PressureThresholdBPS = floatEventValue(target)
-				event.Details = fmt.Sprintf(`{"reason":"observed_below_target","new_target_write_bps":%g,"max_target_write_bps":%g,"source_passes":%d}`, target, qualifiedMaxWriteBPS, sourcePasses)
+				event.PressureThresholdBPS = floatEventValue(baselinePacer.target() + hotspotTarget)
+				event.Details = fmt.Sprintf(`{"reason":"observed_below_target","new_target_write_bps":%g,"baseline_target_write_bps":%g,"hotspot_target_write_bps":%g,"max_target_write_bps":%g,"source_passes":%d}`, baselinePacer.target()+hotspotTarget, baselinePacer.target(), hotspotTarget, qualifiedMaxWriteBPS, sourcePasses)
 			}), snapshots)
 		}
 	}
@@ -1125,17 +1212,18 @@ func jitterDuration(duration time.Duration, jitter float64, random *mathrand.Ran
 	return time.Duration(float64(duration) * factor)
 }
 
-func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, options periodicOptions, seed int64, class burstClass, target hotTarget, targetOK bool) benchmarkEvent {
+func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, options periodicOptions, seed int64, class burstClass, target hotTarget, targetOK bool, snapshot *regionSnapshotBundle) benchmarkEvent {
 	return eventWith(base, "pressure_scheduled", "baseline", cycle, func(event *benchmarkEvent) {
 		event.ScheduledTSMS = scheduled.UnixMilli()
 		event.BurstClass = string(class)
 		event.AutopilotExpect = class.expectation(options.AutopilotExpect)
 		event.PressureThresholdBPS = floatEventValue(class.initialTargetBPS(options))
+		topology := rebalanceTopology(snapshot)
 		if targetOK {
 			event.RegionID = target.regionID
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_label_name":%q,"hot_label_value":%q}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), target.labelName, target.labelValue)
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_label_name":%q,"hot_label_value":%q,"available_region_count":%d,"observed_leader_datanode_count":%d,"rebalance_region_surplus":%d,"rebalance_topology_ready":%t}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), target.labelName, target.labelValue, topology.regionCount, topology.datanodeCount, topology.regionSurplus, topology.ready)
 		} else {
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_target_unavailable":true}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options))
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_target_unavailable":true,"available_region_count":%d,"observed_leader_datanode_count":%d,"rebalance_region_surplus":%d,"rebalance_topology_ready":%t}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), topology.regionCount, topology.datanodeCount, topology.regionSurplus, topology.ready)
 		}
 	})
 }
@@ -1182,6 +1270,43 @@ type regionSnapshotBundle struct {
 	hotTargets     []hotTarget
 	refreshError   string
 	stale          bool
+}
+
+type rebalanceTopologySummary struct {
+	regionCount   uint64
+	datanodeCount uint64
+	regionSurplus int64
+	ready         bool
+}
+
+// rebalanceTopology summarizes the live region snapshot without adding new
+// typed self-monitoring columns. A rebalance needs more movable regions than
+// observed datanodes; the summary lets later analysis distinguish an
+// insufficient topology from a traffic or scheduler failure.
+func rebalanceTopology(bundle *regionSnapshotBundle) rebalanceTopologySummary {
+	if bundle == nil {
+		return rebalanceTopologySummary{}
+	}
+	leaders := make(map[string]struct{})
+	seenRegions := make(map[uint64]struct{})
+	for _, snapshot := range bundle.snapshots {
+		if snapshot.regionID == 0 {
+			continue
+		}
+		seenRegions[snapshot.regionID] = struct{}{}
+		if snapshot.leader != "" {
+			leaders[snapshot.leader] = struct{}{}
+		}
+	}
+	regionCount := uint64(len(seenRegions))
+	datanodeCount := uint64(len(leaders))
+	surplus := int64(regionCount) - int64(datanodeCount)
+	return rebalanceTopologySummary{
+		regionCount:   regionCount,
+		datanodeCount: datanodeCount,
+		regionSurplus: surplus,
+		ready:         datanodeCount > 0 && regionCount > datanodeCount,
+	}
 }
 
 // hotTarget is a config-derived label value that routes writes to one current region.

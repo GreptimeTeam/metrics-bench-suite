@@ -270,12 +270,64 @@ func TestLegacyBurstPeriodStillUsesStartToStartScheduling(t *testing.T) {
 
 func TestPlannedBurstEventRecordsSeedAndSchedule(t *testing.T) {
 	scheduled := time.Unix(100, 0)
-	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256}, 42, burstClassQualified, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true)
+	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256}, 42, burstClassQualified, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true, &regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}, {regionID: 3, leader: "node-a"}}})
 	if event.EventType != "pressure_scheduled" || event.Phase != "baseline" || event.Cycle != 2 || event.ScheduledTSMS != scheduled.UnixMilli() {
 		t.Fatalf("unexpected planned event: %#v", event)
 	}
-	if !strings.Contains(event.Details, `"random_seed":42`) || !strings.Contains(event.Details, `"burst_jitter":0.2`) {
+	if !strings.Contains(event.Details, `"random_seed":42`) || !strings.Contains(event.Details, `"burst_jitter":0.2`) || !strings.Contains(event.Details, `"rebalance_topology_ready":true`) {
 		t.Fatalf("planned event missing scheduling details: %s", event.Details)
+	}
+}
+
+func TestRebalanceTopologyRequiresMoreRegionsThanObservedDatanodes(t *testing.T) {
+	topology := rebalanceTopology(&regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}, {regionID: 3, leader: "node-a"}}})
+	if topology.regionCount != 3 || topology.datanodeCount != 2 || topology.regionSurplus != 1 || !topology.ready {
+		t.Fatalf("unexpected ready topology: %#v", topology)
+	}
+	topology = rebalanceTopology(&regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}}})
+	if topology.ready {
+		t.Fatalf("topology without region surplus must not be ready: %#v", topology)
+	}
+}
+
+func TestWorkloadCollectorSeparatesBaselineAndHotspotTraffic(t *testing.T) {
+	collector := &workloadCollector{}
+	collector.add(writeResult{lane: baselineTrafficLane, requestCount: 1, sampleCount: 2, payloadBytes: 100})
+	collector.add(writeResult{lane: hotspotTrafficLane, requestCount: 3, sampleCount: 4, payloadBytes: 200})
+	metrics := collector.reset()
+	if metrics.payloadBytes != 300 || metrics.baseline.payloadBytes != 100 || metrics.hotspot.payloadBytes != 200 || metrics.baseline.sampleCount != 2 || metrics.hotspot.requestCount != 3 {
+		t.Fatalf("unexpected lane metrics: %#v", metrics)
+	}
+}
+
+func TestEnqueuePeriodicRequestsPreservesTrafficLaneAndPacer(t *testing.T) {
+	requests := make(chan periodicWriteRequest, 1)
+	pacer := newBytePacer(1)
+	done := make(chan bool, 1)
+	go func() {
+		done <- enqueuePeriodicRequests(context.Background(), requests, hotspotTrafficLane, pacer, func(raw chan<- prompb.WriteRequest) bool {
+			raw <- prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{Samples: []prompb.Sample{{Timestamp: 1}}}}}
+			return true
+		})
+	}()
+	queued := <-requests
+	if queued.lane != hotspotTrafficLane || queued.pacer != pacer || sampleCount(queued.request) != 1 {
+		t.Fatalf("unexpected queued periodic request: %#v", queued)
+	}
+	if !<-done {
+		t.Fatal("enqueue unexpectedly failed")
+	}
+}
+
+func TestBurstAmplifierAllowsSmallHotspotsToReachPressure(t *testing.T) {
+	amplifier := newBurstAmplifier(4)
+	for amplifier.value() < 256 {
+		if _, increased := amplifier.increase(); !increased {
+			t.Fatalf("amplifier stopped at %d before the small-hotspot cap", amplifier.value())
+		}
+	}
+	if amplifier.value() != 256 {
+		t.Fatalf("amplifier cap = %d, want 256", amplifier.value())
 	}
 }
 
