@@ -35,6 +35,7 @@ const (
 	defaultBaselineTick     = time.Minute
 	defaultBurstActive      = 20 * time.Minute
 	defaultBurstPeriod      = time.Hour
+	defaultBurstGap         = 15 * time.Minute
 	defaultBurstJitter      = 0.2
 	defaultObserveInterval  = 15 * time.Second
 	defaultTransientBurst   = 5 * time.Minute
@@ -47,6 +48,7 @@ type periodicOptions struct {
 	BurstActiveDuration     time.Duration
 	TransientBurstDuration  time.Duration
 	BurstPeriod             time.Duration
+	BurstGap                time.Duration
 	BurstJitter             float64
 	BurstAmplification      uint64
 	BurstCount              uint64
@@ -92,6 +94,9 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	}
 	if options.BurstPeriod, err = parseDuration("burst-period"); err != nil {
 		return periodicOptions{}, fmt.Errorf("parse burst-period: %w", err)
+	}
+	if options.BurstGap, err = parseDuration("burst-gap"); err != nil {
+		return periodicOptions{}, fmt.Errorf("parse burst-gap: %w", err)
 	}
 	if options.BurstJitter, err = cmd.Flags().GetFloat64("burst-jitter"); err != nil {
 		return periodicOptions{}, err
@@ -154,8 +159,8 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 		options.AutopilotConfigHash = hex.EncodeToString(digest[:])
 	}
 
-	if options.BaselineDuration < 0 || options.BaselineTickInterval <= 0 || options.BurstActiveDuration <= 0 || options.TransientBurstDuration <= 0 || options.BurstPeriod < options.BurstActiveDuration || options.BurstPeriod < options.TransientBurstDuration || options.ObserveInterval <= 0 {
-		return periodicOptions{}, fmt.Errorf("baseline-duration must not be negative; baseline-tick-interval, burst-active-duration, transient-burst-duration, and observe-interval must be positive; burst-period must be at least each burst duration")
+	if options.BaselineDuration < 0 || options.BaselineTickInterval <= 0 || options.BurstActiveDuration <= 0 || options.TransientBurstDuration <= 0 || options.BurstGap < 0 || options.ObserveInterval <= 0 {
+		return periodicOptions{}, fmt.Errorf("baseline-duration and burst-gap must not be negative; baseline-tick-interval, burst-active-duration, transient-burst-duration, and observe-interval must be positive")
 	}
 	if options.BurstJitter < 0 || options.BurstJitter > 1 {
 		return periodicOptions{}, fmt.Errorf("burst-jitter must be between 0 and 1")
@@ -177,6 +182,9 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	}
 	if options.TrafficMode != "legacy" && options.TrafficMode != "steady" {
 		return periodicOptions{}, fmt.Errorf("periodic-traffic-mode must be legacy or steady")
+	}
+	if options.TrafficMode == "legacy" && (options.BurstPeriod < options.BurstActiveDuration || options.BurstPeriod < options.TransientBurstDuration) {
+		return periodicOptions{}, fmt.Errorf("burst-period must be at least each burst duration in legacy mode")
 	}
 	if burstClassValue == "" {
 		if options.TrafficMode == "steady" {
@@ -250,13 +258,33 @@ func (c burstClass) initialTargetBPS(options periodicOptions) float64 {
 	return options.BaselineTargetWriteBPS
 }
 
-func nextBurstClass(configured burstClass, random *mathrand.Rand) burstClass {
-	if configured != burstClassMixed {
-		return configured
+type burstClassScheduler struct {
+	configured burstClass
+	random     *mathrand.Rand
+	pending    burstClass
+}
+
+func newBurstClassScheduler(configured burstClass, random *mathrand.Rand) *burstClassScheduler {
+	return &burstClassScheduler{configured: configured, random: random}
+}
+
+// next returns a seeded pair containing one transient and one qualified burst.
+// This preserves random ordering without allowing an unbounded wait for a
+// scheduler-qualifying burst in mixed mode.
+func (s *burstClassScheduler) next() burstClass {
+	if s.configured != burstClassMixed {
+		return s.configured
 	}
-	if random.Intn(2) == 0 {
+	if s.pending != "" {
+		class := s.pending
+		s.pending = ""
+		return class
+	}
+	if s.random.Intn(2) == 0 {
+		s.pending = burstClassQualified
 		return burstClassTransient
 	}
+	s.pending = burstClassTransient
 	return burstClassQualified
 }
 
@@ -779,12 +807,13 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	current := time.Now()
 	churnEpochGenerator := samples.NewChurnEpochGenerator(s.ChurnInterval)
 	random, seed := newPeriodicRandom(options.RandomSeed)
+	classScheduler := newBurstClassScheduler(options.BurstClass, random)
 	firstBurstAt := time.Now().Add(jitterDuration(options.BaselineDuration, options.BurstJitter, random))
 	emitLifecycle("run_started", eventWith(baseEvent, "run_started", "baseline", 0, func(event *benchmarkEvent) {
-		event.Details = fmt.Sprintf(`{"baseline_duration":"%s","baseline_tick_interval":"%s","burst_active_duration":"%s","transient_burst_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"burst_count":%d,"random_seed":%d,"observe_interval":"%s","periodic_traffic_mode":%q,"burst_class":%q,"baseline_target_write_bps":%g,"qualified_max_write_bps":%g,"pressure_high_min_write_bps":%g,"configured_logical_tables":%s}`, options.BaselineDuration, options.BaselineTickInterval, options.BurstActiveDuration, options.TransientBurstDuration, options.BurstPeriod, options.BurstJitter, options.BurstAmplification, options.BurstCount, seed, options.ObserveInterval, options.TrafficMode, options.BurstClass, options.BaselineTargetWriteBPS, options.QualifiedMaxWriteBPS, options.PressureHighMinWriteBPS, mustJSON(logicalTables))
+		event.Details = fmt.Sprintf(`{"baseline_duration":"%s","baseline_tick_interval":"%s","burst_active_duration":"%s","transient_burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"burst_count":%d,"random_seed":%d,"observe_interval":"%s","periodic_traffic_mode":%q,"burst_class":%q,"baseline_target_write_bps":%g,"qualified_max_write_bps":%g,"pressure_high_min_write_bps":%g,"configured_logical_tables":%s}`, options.BaselineDuration, options.BaselineTickInterval, options.BurstActiveDuration, options.TransientBurstDuration, options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, options.BurstCount, seed, options.ObserveInterval, options.TrafficMode, options.BurstClass, options.BaselineTargetWriteBPS, options.QualifiedMaxWriteBPS, options.PressureHighMinWriteBPS, mustJSON(logicalTables))
 	}), currentSnapshot(snapshots))
 	for cycle := uint64(1); options.BurstCount == 0 || cycle <= options.BurstCount; cycle++ {
-		class := nextBurstClass(options.BurstClass, random)
+		class := classScheduler.next()
 		plannedTarget, targetOK := selectHotTarget(currentSnapshot(snapshots), random)
 		emitLifecycle("pressure_scheduled", plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, class, plannedTarget, targetOK), currentSnapshot(snapshots))
 		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, firstBurstAt, options.BaselineTickInterval, "baseline", 0, options, writer, snapshots, baseEvent, nil, burstClassTransient); err != nil {
@@ -829,10 +858,7 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 				event.Details = "active requests drained"
 			}), snapshots)
 		}
-		firstBurstAt = firstBurstAt.Add(jitterDuration(options.BurstPeriod, options.BurstJitter, random))
-		if minimum := time.Now().Add(options.BaselineTickInterval); firstBurstAt.Before(minimum) {
-			firstBurstAt = minimum
-		}
+		firstBurstAt = nextBurstStart(options, firstBurstAt, time.Now(), random)
 	}
 
 	cancelObserver()
@@ -845,6 +871,17 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	}
 	emitWithCurrentSnapshot(writer, ctx, eventWith(baseEvent, "run_completed", "completed", 0, nil), snapshots)
 	return nil
+}
+
+func nextBurstStart(options periodicOptions, previousStart, activeFinished time.Time, random *mathrand.Rand) time.Time {
+	if options.TrafficMode == "steady" {
+		return activeFinished.Add(options.BurstGap)
+	}
+	next := previousStart.Add(jitterDuration(options.BurstPeriod, options.BurstJitter, random))
+	if minimum := activeFinished.Add(options.BaselineTickInterval); next.Before(minimum) {
+		return minimum
+	}
+	return next
 }
 
 func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, deadline time.Time, tickInterval time.Duration, phase string, cycle uint64, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, target *hotTarget, class burstClass) error {
@@ -1096,9 +1133,9 @@ func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, o
 		event.PressureThresholdBPS = floatEventValue(class.initialTargetBPS(options))
 		if targetOK {
 			event.RegionID = target.regionID
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_label_name":%q,"hot_label_value":%q}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), target.labelName, target.labelValue)
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_label_name":%q,"hot_label_value":%q}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), target.labelName, target.labelValue)
 		} else {
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_target_unavailable":true}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options))
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_target_unavailable":true}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options))
 		}
 	})
 }
