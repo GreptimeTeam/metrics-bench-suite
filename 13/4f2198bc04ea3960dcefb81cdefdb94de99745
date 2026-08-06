@@ -1,0 +1,19 @@
+pkg/cmd/sample_loader/sample_loader.go
+  s_c43176d290fd97::t_7e89b8ad6bec13 649-651
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "134f2198bc04ea3960dcefb81cdefdb94de99745",
+  "prompts": {},
+  "sessions": {
+    "s_c43176d290fd97": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb9f-8822-70f1-a730-37d4d0368ea2",
+        "model": "unknown"
+      },
+      "human_author": "WenyXu <wenymedia@gmail.com>"
+    }
+  }
+}
