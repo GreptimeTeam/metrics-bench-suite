@@ -78,6 +78,74 @@ func TestPeriodicCaseSuppliesItsOwnExpectation(t *testing.T) {
 	}
 }
 
+func TestAlternatingCaseSuppliesQualifiedFocusedWorkload(t *testing.T) {
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"target-physical-table":       "metrics_physical",
+		"pressure-high-min-write-bps": "1",
+		"baseline-duration":           "0s",
+		"burst-active-duration":       "1s",
+		"transient-burst-duration":    "1s",
+		"burst-period":                "1s",
+		"observe-interval":            "1s",
+		"autopilot-case":              autopilotCaseAlternating,
+		"autopilot-rate-mode":         autopilotRateModeStableRegion,
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	options, err := periodicOptionsFromCommand(cmd, &SampleLoader{DryRun: true, TickInterval: time.Second, Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.BurstClass != burstClassQualified || !options.usesStableRegionRateMode() {
+		t.Fatalf("alternating case must use qualified stable scheduler workload: %#v", options)
+	}
+}
+
+func TestStableRegionRateModeIsOptInForAutopilotCases(t *testing.T) {
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"target-physical-table":       "metrics_physical",
+		"pressure-high-min-write-bps": "1",
+		"baseline-duration":           "0s",
+		"burst-active-duration":       "1s",
+		"transient-burst-duration":    "1s",
+		"burst-period":                "1s",
+		"observe-interval":            "1s",
+		"autopilot-case":              "repartition",
+		"autopilot-rate-mode":         "stable-region",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	options, err := periodicOptionsFromCommand(cmd, &SampleLoader{DryRun: true, TickInterval: time.Second, Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !options.usesStableRegionRateMode() || options.AutopilotBatchSamples != 1000 {
+		t.Fatalf("stable-region mode must be enabled for a scheduler case: %#v", options)
+	}
+	options.AutopilotCase = ""
+	if options.usesStableRegionRateMode() {
+		t.Fatal("stable-region pacing must not change non-case periodic workloads")
+	}
+}
+
+func TestStableRegionRateModeBoundsRemoteWriteBatchSize(t *testing.T) {
+	if got := stableRegionBatchSamples(20_000, 1_000, 0); got != 1_000 {
+		t.Fatalf("stable scheduler mode must bound default batch size, got %d", got)
+	}
+	if got := stableRegionBatchSamples(500, 1_000, 0); got != 500 {
+		t.Fatalf("stable scheduler mode must preserve a caller's smaller batch, got %d", got)
+	}
+	if got := stableRegionBatchSamples(20_000, 1_000, 128); got != 128 {
+		t.Fatalf("repartition scheduler mode must keep the stream continuous, got %d", got)
+	}
+}
+
 func TestSteadyTrafficDefaultsToMixedBursts(t *testing.T) {
 	cmd := NewCommand()
 	for name, value := range map[string]string{
@@ -332,12 +400,55 @@ func TestLegacyBurstPeriodStillUsesStartToStartScheduling(t *testing.T) {
 
 func TestPlannedBurstEventRecordsSeedAndSchedule(t *testing.T) {
 	scheduled := time.Unix(100, 0)
-	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256, AutopilotSchedule: defaultAutopilotSchedule()}, 42, "repartition", burstPlan{class: burstClassQualified, duration: time.Minute, targetWriteBPS: 1536, maximumWriteBPS: 3072, pressureScale: 1.0}, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true, &regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}, {regionID: 3, leader: "node-a"}}})
+	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256, AutopilotSchedule: defaultAutopilotSchedule()}, 42, autopilotCaseSelection{caseKind: autopilotCaseRepartition, desiredCase: autopilotCaseRepartition, nextCase: autopilotCaseMigration, sequence: 2}, burstPlan{class: burstClassQualified, duration: time.Minute, targetWriteBPS: 1536, maximumWriteBPS: 3072, pressureScale: 1.0}, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true, 16, 128, &regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}, {regionID: 3, leader: "node-a"}}})
 	if event.EventType != "pressure_scheduled" || event.Phase != "baseline" || event.Cycle != 2 || event.ScheduledTSMS != scheduled.UnixMilli() {
 		t.Fatalf("unexpected planned event: %#v", event)
 	}
-	if !strings.Contains(event.Details, `"random_seed":42`) || !strings.Contains(event.Details, `"burst_jitter":0.2`) || !strings.Contains(event.Details, `"rebalance_topology_ready":true`) {
+	if !strings.Contains(event.Details, `"random_seed":42`) || !strings.Contains(event.Details, `"next_autopilot_case":"migration"`) || !strings.Contains(event.Details, `"effective_autopilot_batch_samples":128`) || !strings.Contains(event.Details, `"rebalance_topology_ready":true`) {
 		t.Fatalf("planned event missing scheduling details: %s", event.Details)
+	}
+}
+
+func TestAlternatingAutopilotCasesAlternateAfterEligibleTargets(t *testing.T) {
+	bundle := &regionSnapshotBundle{
+		datanodeCount: 3,
+		snapshots:     []regionSnapshot{{regionID: 1, leader: "dn-1"}, {regionID: 2, leader: "dn-1"}, {regionID: 3, leader: "dn-1"}, {regionID: 4, leader: "dn-1"}},
+		hotTargets:    []hotTarget{{regionID: 1}, {regionID: 2}, {regionID: 3}, {regionID: 4}},
+	}
+	scheduler := newAutopilotCaseScheduler(autopilotCaseAlternating)
+
+	first := scheduler.selectCase(bundle)
+	if first.caseKind != autopilotCaseRepartition || first.desiredCase != autopilotCaseRepartition || first.sequence != 1 {
+		t.Fatalf("first alternating selection = %#v", first)
+	}
+	scheduler.advance(&first, true)
+	if first.nextCase != autopilotCaseMigration {
+		t.Fatalf("next case after repartition = %q, want migration", first.nextCase)
+	}
+
+	second := scheduler.selectCase(bundle)
+	if second.caseKind != autopilotCaseMigration || second.desiredCase != autopilotCaseMigration || second.sequence != 2 {
+		t.Fatalf("second alternating selection = %#v", second)
+	}
+	scheduler.advance(&second, true)
+	if second.nextCase != autopilotCaseRepartition {
+		t.Fatalf("next case after migration = %q, want repartition", second.nextCase)
+	}
+}
+
+func TestAlternatingAutopilotCasesRetainMigrationAfterBootstrap(t *testing.T) {
+	withoutSurplus := &regionSnapshotBundle{datanodeCount: 3, snapshots: []regionSnapshot{{regionID: 1}, {regionID: 2}, {regionID: 3}}}
+	scheduler := newAutopilotCaseScheduler(autopilotCaseAlternating)
+
+	first := scheduler.selectCase(withoutSurplus)
+	scheduler.advance(&first, true)
+	bootstrap := scheduler.selectCase(withoutSurplus)
+	if bootstrap.caseKind != autopilotCaseRepartition || bootstrap.desiredCase != autopilotCaseMigration || !bootstrap.migrationBootstrap {
+		t.Fatalf("migration bootstrap selection = %#v", bootstrap)
+	}
+	scheduler.advance(&bootstrap, true)
+	if bootstrap.nextCase != autopilotCaseMigration {
+		t.Fatalf("bootstrap must retain pending migration, next = %q", bootstrap.nextCase)
 	}
 }
 
@@ -430,6 +541,128 @@ func TestFocusedCaseProducesBaselineAndHotspotConcurrently(t *testing.T) {
 	}
 }
 
+func TestStableFocusedCaseFillsBytePacerWithoutWaitingForScrapeTicker(t *testing.T) {
+	var requests atomic.Uint64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		requests.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	lower, upper := 0.0, 1.0
+	fileConfigs := []samples.FileConfig{{
+		Name: "representative",
+		Config: samples.Config{
+			Tags: []samples.Tag{{
+				Name: "namespace",
+				Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{
+					{Value: "app-0", Weight: 1}, {Value: "app-1", Weight: 1},
+				}},
+			}},
+			Fields: []samples.Field{{Name: "value", Dist: samples.Distribution{Type: "uniform", LowerBound: &lower, UpperBound: &upper}}},
+		},
+	}}
+	snapshots := &regionSnapshotStore{}
+	snapshots.set(&regionSnapshotBundle{hotTargets: []hotTarget{
+		{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+		{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+	}})
+	loader := &SampleLoader{
+		RemoteWriteURL: server.URL,
+		Interval:       time.Second,
+		MaxSamples:     10,
+		Workers:        2,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	current := time.Now()
+	err := loader.runPeriodicWrites(ctx, fileConfigs, &current, samples.NewChurnEpochGenerator(0), time.Now().Add(time.Second), time.Hour, "active", 1, periodicOptions{
+		TrafficMode:           "steady",
+		AutopilotCase:         "repartition",
+		AutopilotRateMode:     autopilotRateModeStableRegion,
+		AutopilotBatchSamples: 10,
+	}, nil, snapshots, benchmarkEvent{}, &hotTarget{
+		regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}, caseValues: []string{"app-0", "app-1"},
+	}, burstPlan{class: burstClassQualified, targetWriteBPS: 64 * 1024, maximumWriteBPS: 64 * 1024})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("focused stable case error = %v, want context deadline", err)
+	}
+	// The legacy ticker-capped loop emits its initial 32 hot passes, then
+	// waits an hour. Stable-region mode must instead keep the byte pacer full.
+	if got := requests.Load(); got <= 40 {
+		t.Fatalf("expected stable byte-paced writes beyond the initial passes, got %d", got)
+	}
+}
+
+func TestFocusedCaseRefreshesRoutingLanesAfterMappingChange(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer remote.Close()
+	events := make(chan benchmarkEvent, 16)
+	monitoring := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		decoder := json.NewDecoder(request.Body)
+		for {
+			var event benchmarkEvent
+			if err := decoder.Decode(&event); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Error(err)
+				break
+			}
+			events <- event
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer monitoring.Close()
+
+	lower, upper := 0.0, 1.0
+	fileConfigs := []samples.FileConfig{{
+		Name: "representative",
+		Config: samples.Config{
+			Tags:   []samples.Tag{{Name: "namespace", Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{{Value: "app-0", Weight: 1}, {Value: "app-1", Weight: 1}}}}},
+			Fields: []samples.Field{{Name: "value", Dist: samples.Distribution{Type: "uniform", LowerBound: &lower, UpperBound: &upper}}},
+		},
+	}}
+	snapshots := &regionSnapshotStore{}
+	snapshots.set(&regionSnapshotBundle{mappingVersion: 1, mappingFingerprint: "before", hotTargets: []hotTarget{
+		{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+		{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+	}})
+	time.AfterFunc(30*time.Millisecond, func() {
+		snapshots.set(&regionSnapshotBundle{mappingVersion: 2, mappingFingerprint: "after", hotTargets: []hotTarget{
+			{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+			{regionID: 3, labelName: "namespace", labelValues: []string{"app-1"}},
+		}})
+	})
+	loader := &SampleLoader{RemoteWriteURL: remote.URL, Interval: time.Millisecond, MaxSamples: 10, Workers: 2}
+	writer := newEventWriter(periodicOptions{MonitoringURL: monitoring.URL + "/v1/ingest"})
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Millisecond)
+	defer cancel()
+	current := time.Now()
+	err := loader.runPeriodicWrites(ctx, fileConfigs, &current, samples.NewChurnEpochGenerator(0), time.Now().Add(time.Second), time.Hour, "active", 1, periodicOptions{
+		TrafficMode:           "steady",
+		AutopilotCase:         autopilotCaseRepartition,
+		AutopilotRateMode:     autopilotRateModeStableRegion,
+		AutopilotBatchSamples: 10,
+	}, writer, snapshots, benchmarkEvent{RunID: "run-1"}, &hotTarget{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}, caseValues: []string{"app-1"}}, burstPlan{class: burstClassQualified, targetWriteBPS: 64 * 1024, maximumWriteBPS: 64 * 1024})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("focused routing refresh error = %v, want context deadline", err)
+	}
+	if err := writer.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for len(events) > 0 {
+		event := <-events
+		if event.EventType == "workload_routes_refreshed" && strings.Contains(event.Details, `"current_mapping_version":2`) && strings.Contains(event.Details, `"hot_region_ids":[3]`) {
+			return
+		}
+	}
+	t.Fatal("expected a flushed workload_routes_refreshed event with remapped region")
+}
+
 func TestBurstAmplifierAllowsSmallHotspotsToReachPressure(t *testing.T) {
 	amplifier := newBurstAmplifier(4)
 	for amplifier.value() < 256 {
@@ -465,11 +698,64 @@ func TestExplicitQualifiedCaseReservesSourceDerivedStabilizationPlateau(t *testi
 		},
 	}
 	plan := newBurstPlan(options, burstClassQualified, mathrand.New(mathrand.NewSource(1)))
-	if want := 6 * 45 * time.Second; plan.duration != want {
+	if want := 8 * 45 * time.Second; plan.duration != want {
 		t.Fatalf("qualified case duration = %s, want %s", plan.duration, want)
 	}
 	if legacy := newBurstPlan(periodicOptions{BurstActiveDuration: time.Minute}, burstClassQualified, mathrand.New(mathrand.NewSource(1))); legacy.duration != time.Minute {
 		t.Fatalf("legacy qualified duration = %s, want configured value", legacy.duration)
+	}
+}
+
+func TestMigrationPlanReservesRegionBalancerSourceTrigger(t *testing.T) {
+	options := periodicOptions{AutopilotSchedule: defaultAutopilotSchedule()}
+	plan := qualifyMigrationPlan(options, burstPlan{class: burstClassQualified, targetWriteBPS: 1, maximumWriteBPS: 1}, autopilotCaseMigration)
+	want := float64(4*1024*1024) * 1.32
+	if math.Abs(plan.targetWriteBPS-want) > 1 {
+		t.Fatalf("migration target = %f, want %f", plan.targetWriteBPS, want)
+	}
+	if plan.maximumWriteBPS < plan.targetWriteBPS {
+		t.Fatalf("migration maximum = %f, target = %f", plan.maximumWriteBPS, plan.targetWriteBPS)
+	}
+	if unchanged := qualifyMigrationPlan(options, burstPlan{class: burstClassQualified, targetWriteBPS: 1}, autopilotCaseRepartition); unchanged.targetWriteBPS != 1 {
+		t.Fatalf("repartition plan must stay unchanged: %#v", unchanged)
+	}
+}
+
+func TestStableMigrationPlanCapsGenericPressureAroundSourceDerivedFloor(t *testing.T) {
+	options := periodicOptions{
+		AutopilotCase:     autopilotCaseMigration,
+		AutopilotRateMode: autopilotRateModeStableRegion,
+		AutopilotSchedule: defaultAutopilotSchedule(),
+	}
+	plan := qualifyMigrationPlan(options, burstPlan{
+		class:           burstClassQualified,
+		targetWriteBPS:  18 * 1024 * 1024,
+		maximumWriteBPS: 24 * 1024 * 1024,
+		pressureScale:   0.8,
+	}, autopilotCaseMigration)
+	base := float64(4*1024*1024) * 1.32
+	if want := base * 0.8; math.Abs(plan.targetWriteBPS-want) > 1 {
+		t.Fatalf("stable migration target = %f, want %f", plan.targetWriteBPS, want)
+	}
+	if want := base * maxPressureScale; math.Abs(plan.maximumWriteBPS-want) > 1 {
+		t.Fatalf("stable migration maximum = %f, want %f", plan.maximumWriteBPS, want)
+	}
+}
+
+func TestRepartitionPlanCapsHighGenericBurstForStableHistory(t *testing.T) {
+	plan := qualifyRepartitionPlan(burstPlan{class: burstClassQualified, targetWriteBPS: 12 * 1024 * 1024, maximumWriteBPS: 24 * 1024 * 1024}, autopilotCaseRepartition)
+	if plan.targetWriteBPS != stableRepartitionTargetBPS || plan.maximumWriteBPS != stableRepartitionTargetBPS*maxPressureScale {
+		t.Fatalf("repartition plan must cap the generic burst: %#v", plan)
+	}
+	if plan.schedulerBatchSamples != stableRepartitionBatchSamples {
+		t.Fatalf("repartition scheduler batch size = %d, want %d", plan.schedulerBatchSamples, stableRepartitionBatchSamples)
+	}
+	varied := qualifyRepartitionPlan(burstPlan{class: burstClassQualified, targetWriteBPS: 12 * 1024 * 1024, maximumWriteBPS: 24 * 1024 * 1024, pressureScale: 0.8}, autopilotCaseRepartition)
+	if varied.targetWriteBPS != stableRepartitionTargetBPS*0.8 {
+		t.Fatalf("repartition plan must retain seeded variation: %#v", varied)
+	}
+	if unchanged := qualifyRepartitionPlan(burstPlan{class: burstClassQualified, targetWriteBPS: 1}, autopilotCaseMigration); unchanged.targetWriteBPS != 1 {
+		t.Fatalf("migration plan must stay unchanged: %#v", unchanged)
 	}
 }
 
@@ -481,6 +767,23 @@ func TestExplicitCaseRetainsSmallStableBaseline(t *testing.T) {
 	}
 	if got := activeBaselineTarget(options, plan, false); got != options.BaselineTargetWriteBPS {
 		t.Fatalf("legacy baseline = %f, want %f", got, options.BaselineTargetWriteBPS)
+	}
+}
+
+func TestStableRegionCaseRaisesWorkerFloorWithoutChangingLegacyWorkers(t *testing.T) {
+	target := &hotTarget{labelName: "namespace", caseValues: []string{"app-1", "app-2", "app-3"}}
+	stable := periodicOptions{AutopilotCase: autopilotCaseMigration, AutopilotRateMode: autopilotRateModeStableRegion}
+	if got, want := schedulerWorkerCount(4, stable, target, 5), 5+3*stableTargetWorkers; got != want {
+		t.Fatalf("stable worker floor = %d, want %d", got, want)
+	}
+	if got := schedulerWorkerCount(21, stable, target, 5); got != 21 {
+		t.Fatalf("stable worker count must retain a larger user value, got %d", got)
+	}
+	if got := schedulerWorkerCount(4, periodicOptions{AutopilotCase: autopilotCaseMigration}, target, 5); got != 4 {
+		t.Fatalf("legacy worker count = %d, want configured value", got)
+	}
+	if got := schedulerWorkerCount(4, stable, nil, 5); got != 4 {
+		t.Fatalf("baseline worker count = %d, want configured value", got)
 	}
 }
 
@@ -521,9 +824,24 @@ func TestMigrationCaseBootstrapsRepartitionUntilTopologyHasRegionSurplus(t *test
 	if got := effectiveAutopilotCase("migration", withoutSurplus); got != "repartition" {
 		t.Fatalf("migration case without surplus = %q, want repartition bootstrap", got)
 	}
-	withSurplus := &regionSnapshotBundle{datanodeCount: 3, snapshots: []regionSnapshot{{regionID: 1}, {regionID: 2}, {regionID: 3}, {regionID: 4}}}
+	withSurplus := &regionSnapshotBundle{
+		datanodeCount: 3,
+		snapshots:     []regionSnapshot{{regionID: 1, leader: "dn-1"}, {regionID: 2, leader: "dn-1"}, {regionID: 3, leader: "dn-1"}, {regionID: 4, leader: "dn-1"}},
+		hotTargets:    []hotTarget{{regionID: 1}, {regionID: 2}, {regionID: 3}, {regionID: 4}},
+	}
 	if got := effectiveAutopilotCase("migration", withSurplus); got != "migration" {
 		t.Fatalf("migration case with surplus = %q, want migration", got)
+	}
+}
+
+func TestMigrationCaseBootstrapsRepartitionWithoutColocatedHotRegions(t *testing.T) {
+	bundle := &regionSnapshotBundle{
+		datanodeCount: 3,
+		snapshots:     []regionSnapshot{{regionID: 1, leader: "dn-1"}, {regionID: 2, leader: "dn-1"}, {regionID: 3, leader: "dn-2"}, {regionID: 4, leader: "dn-3"}},
+		hotTargets:    []hotTarget{{regionID: 1}, {regionID: 2}, {regionID: 3}, {regionID: 4}},
+	}
+	if got := effectiveAutopilotCase(autopilotCaseMigration, bundle); got != autopilotCaseRepartition {
+		t.Fatalf("migration case without colocated hot regions = %q, want repartition bootstrap", got)
 	}
 }
 
@@ -563,15 +881,18 @@ func TestConfigHotTargetsGroupsMultipleValuesInOneRegion(t *testing.T) {
 
 func TestMigrationTargetUsesColocatedRegions(t *testing.T) {
 	bundle := &regionSnapshotBundle{
+		datanodeCount: 2,
 		hotTargets: []hotTarget{
 			{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
 			{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
 			{regionID: 3, labelName: "namespace", labelValues: []string{"app-2"}},
+			{regionID: 4, labelName: "namespace", labelValues: []string{"app-3"}},
 		},
 		snapshots: []regionSnapshot{
 			{regionID: 1, leader: "dn-1"},
 			{regionID: 2, leader: "dn-1"},
-			{regionID: 3, leader: "dn-2"},
+			{regionID: 3, leader: "dn-1"},
+			{regionID: 4, leader: "dn-2"},
 		},
 	}
 	target, ok := selectHotTarget(bundle, mathrand.New(mathrand.NewSource(1)), "migration")
@@ -596,15 +917,50 @@ func TestMigrationTargetRequiresColocation(t *testing.T) {
 	}
 }
 
+func TestMigrationTargetUsesDatanodeCountColocatedRegions(t *testing.T) {
+	bundle := &regionSnapshotBundle{
+		datanodeCount: 3,
+		hotTargets: []hotTarget{
+			{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+			{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+			{regionID: 3, labelName: "namespace", labelValues: []string{"app-2"}},
+			{regionID: 4, labelName: "namespace", labelValues: []string{"app-3"}},
+		},
+		snapshots: []regionSnapshot{
+			{regionID: 1, leader: "dn-1"},
+			{regionID: 2, leader: "dn-1"},
+			{regionID: 3, leader: "dn-1"},
+			{regionID: 4, leader: "dn-2"},
+		},
+	}
+	if !migrationTargetReady(bundle) {
+		t.Fatal("three colocated regions must be a migration-ready source on three datanodes")
+	}
+	target, ok := selectHotTarget(bundle, mathrand.New(mathrand.NewSource(1)), autopilotCaseMigration)
+	if !ok || !reflect.DeepEqual(hotTargetRegionIDs(target), []uint64{1, 2, 3}) {
+		t.Fatalf("migration target = %#v, ok=%t; want colocated regions [1 2 3]", target, ok)
+	}
+}
+
 func TestBalancedMigrationTargetsPreferComparableConfiguredVolume(t *testing.T) {
-	group := []hotTarget{{regionID: 1}, {regionID: 2}, {regionID: 3}}
+	group := []hotTarget{{regionID: 1}, {regionID: 2}, {regionID: 3}, {regionID: 4}}
 	got := balancedMigrationTargets(group, []sharedpartition.RegionDistribution{
 		{RegionID: 1, SeriesCount: 10},
 		{RegionID: 2, SeriesCount: 1_000},
 		{RegionID: 3, SeriesCount: 900},
-	})
-	if ids := hotTargetRegionIDs(hotTarget{members: got}); !reflect.DeepEqual(ids, []uint64{2, 3}) {
-		t.Fatalf("balanced migration regions = %v, want [2 3]", ids)
+		{RegionID: 4, SeriesCount: 1_100},
+	}, 3)
+	if ids := hotTargetRegionIDs(hotTarget{members: got}); !reflect.DeepEqual(ids, []uint64{2, 3, 4}) {
+		t.Fatalf("balanced migration regions = %v, want [2 3 4]", ids)
+	}
+}
+
+func TestRequiredMigrationTargetCountFitsOneAverageSizedRegion(t *testing.T) {
+	if got := requiredMigrationTargetCount(&regionSnapshotBundle{datanodeCount: 3}); got != 3 {
+		t.Fatalf("migration target count = %d, want 3", got)
+	}
+	if got := requiredMigrationTargetCount(nil); got != 2 {
+		t.Fatalf("nil migration target count = %d, want fallback 2", got)
 	}
 }
 
@@ -629,17 +985,58 @@ func TestCaseBackgroundPlanUsesConfigDerivedValueForEachRegion(t *testing.T) {
 	}
 }
 
-func TestCaseBackgroundPlanPrefersLargerConfigForStableSampling(t *testing.T) {
+func TestCaseBackgroundPlanPrefersSmallestSufficientConfigForStableSampling(t *testing.T) {
 	fileConfigs := []samples.FileConfig{
 		{Name: "small", SeriesCount: 1, FieldGenerators: map[string]samples.FloatGenerator{}, Config: samples.Config{Tags: []samples.Tag{{Name: "namespace", Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{{Value: "app-0", Weight: 1}}}}}}},
+		{Name: "sufficient", SeriesCount: stableBackgroundMinSeries, FieldGenerators: map[string]samples.FloatGenerator{}, Config: samples.Config{Tags: []samples.Tag{{Name: "namespace", Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{{Value: "app-0", Weight: 1}}}}}}},
 		{Name: "large", SeriesCount: 100, FieldGenerators: map[string]samples.FloatGenerator{}, Config: samples.Config{Tags: []samples.Tag{{Name: "namespace", Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{{Value: "app-0", Weight: 1}}}}}}},
 	}
 	backgrounds := caseBackgroundPlan(fileConfigs, &regionSnapshotBundle{hotTargets: []hotTarget{{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}}}})
-	if len(backgrounds) != 1 || backgrounds[0].fileConfig.Name != "large" {
-		t.Fatalf("expected largest representative config, got %#v", backgrounds)
+	if len(backgrounds) != 1 || backgrounds[0].fileConfig.Name != "sufficient" {
+		t.Fatalf("expected smallest sufficient representative config, got %#v", backgrounds)
 	}
 	if backgrounds[0].fileConfig.FieldGenerators != nil {
 		t.Fatal("background config must not share mutable field-generator cache")
+	}
+	configs := schedulerCaseFileConfigs(fileConfigs, hotTarget{regionID: 1, labelName: "namespace", labelValue: "app-0"}, "app-0")
+	if len(configs) != 1 || configs[0].Name != "sufficient" || configs[0].FieldGenerators != nil {
+		t.Fatalf("scheduler case must use one immutable representative config: %#v", configs)
+	}
+	fallbacks := caseBackgroundPlan(fileConfigs[:1], &regionSnapshotBundle{hotTargets: []hotTarget{{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}}}})
+	if len(fallbacks) != 1 || fallbacks[0].fileConfig.Name != "small" {
+		t.Fatalf("background selection must retain the smallest compatible fallback: %#v", fallbacks)
+	}
+}
+
+func TestRepartitionCaseSelectsSpreadStableValues(t *testing.T) {
+	target := hotTarget{
+		regionID:    7,
+		labelName:   "namespace",
+		labelValues: []string{"app-0", "app-1", "app-2", "app-3", "app-4", "app-5"},
+	}
+	values := chooseRepartitionTargetValues(target, mathrand.New(mathrand.NewSource(4)))
+	if len(values) != 3 || values[0] == values[1] || values[1] == values[2] {
+		t.Fatalf("repartition values = %v, want three spread values", values)
+	}
+	target.caseValues = values
+	passes := stableTargetValuePasses(target, 3)
+	if got := selectedTargetValueSets(target); !reflect.DeepEqual(got, map[uint64][]string{7: values}) {
+		t.Fatalf("selected split input = %#v", got)
+	}
+	if len(passes) != 3 || passes[0].value == passes[1].value || passes[1].value == passes[2].value {
+		t.Fatalf("repartition must retain all selected values in each stable cycle: %#v", passes)
+	}
+}
+
+func TestSelectHotTargetKeepsMultipleSplitValuesForRepartition(t *testing.T) {
+	bundle := &regionSnapshotBundle{hotTargets: []hotTarget{{
+		regionID:    7,
+		labelName:   "namespace",
+		labelValues: []string{"app-0", "app-1", "app-2", "app-3"},
+	}}}
+	target, ok := selectHotTarget(bundle, mathrand.New(mathrand.NewSource(9)), autopilotCaseRepartition)
+	if !ok || len(target.caseValues) != 3 || target.labelValue != target.caseValues[0] {
+		t.Fatalf("repartition target must retain three stable split values: %#v, ok=%t", target, ok)
 	}
 }
 
@@ -683,6 +1080,58 @@ func TestEventWriterBindsWorkloadEventToRegionSnapshot(t *testing.T) {
 	}
 }
 
+func TestRegionSnapshotStoreSignalsOnlyRoutingChanges(t *testing.T) {
+	store := &regionSnapshotStore{}
+	store.set(&regionSnapshotBundle{mappingVersion: 1, mappingFingerprint: "one"})
+	signal := store.mappingChangeSignal(1)
+	store.set(&regionSnapshotBundle{mappingVersion: 1, mappingFingerprint: "one", timestamp: time.Now()})
+	select {
+	case <-signal:
+		t.Fatal("ordinary snapshot refresh must not restart routing producers")
+	default:
+	}
+	store.set(&regionSnapshotBundle{mappingVersion: 2, mappingFingerprint: "two"})
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal("routing change did not signal active workload")
+	}
+	select {
+	case <-store.mappingChangeSignal(1):
+	default:
+		t.Fatal("a caller with an old mapping version must observe the completed change")
+	}
+}
+
+func TestRegionMappingFingerprintIgnoresStatisticsButTracksRouting(t *testing.T) {
+	regions := []regionSnapshot{{regionID: 1, leader: "dn-0", partitionExpression: "namespace", partitionDescription: "< app-1", memtableSize: 10}}
+	targets := []hotTarget{{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}}}
+	first := regionMappingFingerprint(regions, targets)
+	regions[0].memtableSize = 20
+	regions[0].writtenBytesSinceOpen = 100
+	if got := regionMappingFingerprint(regions, targets); got != first {
+		t.Fatalf("statistics-only refresh changed routing fingerprint: %s != %s", got, first)
+	}
+	regions[0].leader = "dn-1"
+	if got := regionMappingFingerprint(regions, targets); got == first {
+		t.Fatal("leader change must change routing fingerprint")
+	}
+}
+
+func TestRemapHotTargetSplitsSelectedValuesAcrossNewRegions(t *testing.T) {
+	original := hotTarget{regionID: 1, labelName: "namespace", labelValues: []string{"app-0", "app-1", "app-2"}, caseValues: []string{"app-0", "app-1", "app-2"}}
+	remapped, ok := remapHotTarget(&regionSnapshotBundle{hotTargets: []hotTarget{
+		{regionID: 2, labelName: "namespace", labelValues: []string{"app-0"}},
+		{regionID: 3, labelName: "namespace", labelValues: []string{"app-1", "app-2"}},
+	}}, original)
+	if !ok {
+		t.Fatal("expected selected values to remap to child regions")
+	}
+	if got, want := selectedTargetValueSets(remapped), map[uint64][]string{2: {"app-0"}, 3: {"app-1", "app-2"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("remapped values = %#v, want %#v", got, want)
+	}
+}
+
 func TestHTTPClientUsesFormSQLAndDatabase(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/sql" {
@@ -719,5 +1168,116 @@ func TestRegionEventMarksCounterReset(t *testing.T) {
 	event := regionEvent(benchmarkEvent{}, current, true, previous)
 	if !event.CounterReset || !event.MemtableDecreased || event.MemtableWriteBPSApprox != 0 {
 		t.Fatalf("unexpected region event: %#v", event)
+	}
+}
+
+func TestRegionStabilityEventRecordsCounterRateAndFlushContext(t *testing.T) {
+	refresher := regionRefresher{
+		rateHistory: make(map[uint64][]regionRateSample),
+		schedule: autopilotSchedule{
+			maxHistoryWindows:  2,
+			repartitionSamples: 3,
+			maxRegionHistoryCV: 0.2,
+		},
+	}
+	previous := regionSnapshot{timestamp: time.Unix(0, 0), regionID: 42, leader: "node-a", writtenBytesSinceOpen: 100, memtableSize: 100}
+	current := regionSnapshot{timestamp: time.Unix(10, 0), regionID: 42, leader: "node-a", writtenBytesSinceOpen: 400, memtableSize: 20}
+	event := refresher.regionStabilityEvent(current, previous, true)
+	if event.EventType != "region_stability_window" || !event.MemtableDecreased || event.WrittenBytesBPS != 30 {
+		t.Fatalf("unexpected stability event: %#v", event)
+	}
+	var details map[string]any
+	if err := json.Unmarshal([]byte(event.Details), &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["throughput_source"] != "written_bytes_since_open_delta" || details["scheduler_write_metric"] != "metasrv_memtable_size_delta_ewma" {
+		t.Fatalf("missing throughput provenance: %#v", details)
+	}
+	if details["sample_count"] != float64(1) || details["stable_estimate"] != false || details["memtable_flush_observed"] != true {
+		t.Fatalf("unexpected stability details: %#v", details)
+	}
+
+	leaderMoved := current
+	leaderMoved.timestamp = leaderMoved.timestamp.Add(10 * time.Second)
+	leaderMoved.leader = "node-b"
+	leaderMoved.writtenBytesSinceOpen += 300
+	event = refresher.regionStabilityEvent(leaderMoved, current, true)
+	if err := json.Unmarshal([]byte(event.Details), &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["history_reset_reason"] != "leader_changed" || details["sample_count"] != float64(0) {
+		t.Fatalf("leader change must reset the estimated history: %#v", details)
+	}
+}
+
+func TestParseAutopilotScheduleReadsRegionHistoryCV(t *testing.T) {
+	schedule := parseAutopilotSchedule("min_samples = 4\nmax_region_history_cv = 0.35", defaultAutopilotSchedule())
+	if schedule.repartitionSamples != 4 || schedule.maxRegionHistoryCV != 0.35 {
+		t.Fatalf("unexpected schedule: %#v", schedule)
+	}
+}
+
+func TestParseAutopilotScheduleReadsRegionBalancerLoadSettings(t *testing.T) {
+	schedule := parseAutopilotSchedule("min_load_threshold = '6MiB'\nacceptable_load_ratio = 0.2", defaultAutopilotSchedule())
+	if schedule.rebalanceMinLoadBPS != 6*1024*1024 || schedule.rebalanceAcceptableLoadRatio != 0.2 {
+		t.Fatalf("unexpected rebalance schedule: %#v", schedule)
+	}
+}
+
+func TestStableTargetValuePassesRepeatOneConfiguredValueWithinCase(t *testing.T) {
+	target := hotTarget{
+		regionID:    1109,
+		labelName:   "namespace",
+		labelValue:  "app-27",
+		labelValues: []string{"app-26", "app-27"},
+	}
+	passes := stableTargetValuePasses(target, 4)
+	if len(passes) != 4 {
+		t.Fatalf("unexpected pass count: %#v", passes)
+	}
+	for _, pass := range passes {
+		if pass.target.regionID != target.regionID || pass.target.labelName != target.labelName || pass.value != "app-27" {
+			t.Fatalf("unexpected target pass: %#v", pass)
+		}
+	}
+
+	passes = stableTargetValuePasses(target, 1)
+	if len(passes) != 1 || passes[0].value != "app-27" {
+		t.Fatalf("a stable scheduler target must retain one selected value: %#v", passes)
+	}
+	if got := chooseStableTargetValue(target, mathrand.New(mathrand.NewSource(1))); got != "app-27" {
+		t.Fatalf("seeded value selection = %q, want app-27", got)
+	}
+}
+
+func TestStableTargetValuePassesCoverMigrationMembers(t *testing.T) {
+	target := hotTarget{members: []hotTarget{
+		{regionID: 1108, labelName: "namespace", labelValue: "app-23", labelValues: []string{"app-23", "app-24"}},
+		{regionID: 1109, labelName: "namespace", labelValue: "app-27", labelValues: []string{"app-26", "app-27"}},
+	}}
+	passes := stableTargetValuePasses(target, 2)
+	if len(passes) != 2 {
+		t.Fatalf("migration case must cover every selected member value: %#v", passes)
+	}
+	got := make(map[uint64][]string)
+	for _, pass := range passes {
+		got[pass.target.regionID] = append(got[pass.target.regionID], pass.value)
+	}
+	if !reflect.DeepEqual(got, map[uint64][]string{1108: {"app-23"}, 1109: {"app-27"}}) {
+		t.Fatalf("unexpected migration value coverage: %#v", got)
+	}
+	if got := selectedTargetLabelValues(target); !reflect.DeepEqual(got, map[uint64]string{1108: "app-23", 1109: "app-27"}) {
+		t.Fatalf("unexpected selected target values: %#v", got)
+	}
+}
+
+func TestStableRegionRateModeDisablesAdaptivePressure(t *testing.T) {
+	pacer := newBytePacer(1024)
+	plan := burstPlan{class: burstClassQualified}
+	if !adaptivePressureEnabled(periodicOptions{AutopilotRateMode: autopilotRateModeLegacy, AutopilotCase: "repartition"}, "active", plan, workloadMetrics{}, pacer) {
+		t.Fatal("legacy scheduler case must retain adaptive pressure behavior")
+	}
+	if adaptivePressureEnabled(periodicOptions{AutopilotRateMode: autopilotRateModeStableRegion, AutopilotCase: "repartition"}, "active", plan, workloadMetrics{}, pacer) {
+		t.Fatal("stable-region scheduler case must preserve its planned per-region rate")
 	}
 }
