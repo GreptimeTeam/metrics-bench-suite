@@ -40,6 +40,15 @@ const (
 	defaultObserveInterval  = 15 * time.Second
 	defaultTransientBurst   = 5 * time.Minute
 	workloadWindowInterval  = 10 * time.Second
+	defaultAutopilotWindow  = 45 * time.Second
+	defaultAutopilotSamples = 3
+	minPressureScale        = 0.8
+	maxPressureScale        = 1.2
+	minTransientScale       = 0.35
+	maxTransientScale       = 0.7
+	minCaseBurstPasses      = 128
+	caseBaselineRatio       = 0.25
+	defaultHistoryWindows   = 5
 )
 
 type periodicOptions struct {
@@ -58,6 +67,7 @@ type periodicOptions struct {
 	TargetDatabase          string
 	TargetPhysicalTable     string
 	AutopilotExpect         string
+	AutopilotCase           string
 	PressureHighMinWriteBPS float64
 	TrafficMode             string
 	BurstClass              burstClass
@@ -67,6 +77,28 @@ type periodicOptions struct {
 	MonitoringAuthorization string
 	AutopilotConfigSnapshot string
 	AutopilotConfigHash     string
+	AutopilotSchedule       autopilotSchedule
+}
+
+// autopilotSchedule contains only the source-level timing guards needed to
+// construct a safe transient probe. Defaults mirror the Enterprise options and
+// are overridden by an effective TOML snapshot when present.
+type autopilotSchedule struct {
+	samplingWindow      time.Duration
+	maxHistoryWindows   int
+	repartitionSamples  int
+	writeStableWindows  int
+	migrationMinSamples int
+}
+
+func defaultAutopilotSchedule() autopilotSchedule {
+	return autopilotSchedule{
+		samplingWindow:      defaultAutopilotWindow,
+		maxHistoryWindows:   defaultHistoryWindows,
+		repartitionSamples:  defaultAutopilotSamples,
+		writeStableWindows:  2,
+		migrationMinSamples: defaultAutopilotSamples,
+	}
 }
 
 func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (periodicOptions, error) {
@@ -79,6 +111,7 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	}
 
 	options := periodicOptions{}
+	options.AutopilotSchedule = defaultAutopilotSchedule()
 	var err error
 	if options.BaselineDuration, err = parseDuration("baseline-duration"); err != nil {
 		return periodicOptions{}, fmt.Errorf("parse baseline-duration: %w", err)
@@ -125,6 +158,9 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	if options.AutopilotExpect, err = cmd.Flags().GetString("autopilot-expect"); err != nil {
 		return periodicOptions{}, err
 	}
+	if options.AutopilotCase, err = cmd.Flags().GetString("autopilot-case"); err != nil {
+		return periodicOptions{}, err
+	}
 	if options.PressureHighMinWriteBPS, err = cmd.Flags().GetFloat64("pressure-high-min-write-bps"); err != nil {
 		return periodicOptions{}, err
 	}
@@ -157,6 +193,7 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 		options.AutopilotConfigSnapshot = redactConfigSnapshot(string(data))
 		digest := sha256.Sum256(data)
 		options.AutopilotConfigHash = hex.EncodeToString(digest[:])
+		options.AutopilotSchedule = parseAutopilotSchedule(string(data), options.AutopilotSchedule)
 	}
 
 	if options.BaselineDuration < 0 || options.BaselineTickInterval <= 0 || options.BurstActiveDuration <= 0 || options.TransientBurstDuration <= 0 || options.BurstGap < 0 || options.ObserveInterval <= 0 {
@@ -174,7 +211,10 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	if options.TargetDatabase == "" || options.TargetPhysicalTable == "" {
 		return periodicOptions{}, fmt.Errorf("target-database and target-physical-table are required in periodic-burst mode")
 	}
-	if !cmd.Flags().Changed("autopilot-expect") || (options.AutopilotExpect != "repartition" && options.AutopilotExpect != "rebalance" && options.AutopilotExpect != "both") {
+	if options.AutopilotCase != "" && options.AutopilotCase != "repartition" && options.AutopilotCase != "migration" && options.AutopilotCase != "transient" {
+		return periodicOptions{}, fmt.Errorf("autopilot-case must be repartition, migration, or transient")
+	}
+	if options.AutopilotCase == "" && (!cmd.Flags().Changed("autopilot-expect") || (options.AutopilotExpect != "repartition" && options.AutopilotExpect != "rebalance" && options.AutopilotExpect != "both")) {
 		return periodicOptions{}, fmt.Errorf("autopilot-expect must be explicitly set to repartition, rebalance, or both in periodic-burst mode")
 	}
 	if options.PressureHighMinWriteBPS <= 0 {
@@ -197,6 +237,11 @@ func periodicOptionsFromCommand(cmd *cobra.Command, loader *SampleLoader) (perio
 	}
 	if !options.BurstClass.valid() {
 		return periodicOptions{}, fmt.Errorf("burst-class must be mixed, transient, or qualified")
+	}
+	if options.AutopilotCase == "transient" {
+		options.BurstClass = burstClassTransient
+	} else if options.AutopilotCase != "" {
+		options.BurstClass = burstClassQualified
 	}
 	if options.BaselineTargetWriteBPS < 0 || options.QualifiedMaxWriteBPS < 0 {
 		return periodicOptions{}, fmt.Errorf("baseline-target-write-bps and qualified-max-write-bps must not be negative")
@@ -242,6 +287,129 @@ func (c burstClass) expectation(configured string) string {
 		return "none"
 	}
 	return configured
+}
+
+func (o periodicOptions) expectedAutopilotAction(class burstClass) string {
+	return expectedAutopilotAction(o.AutopilotCase, class, o.AutopilotExpect)
+}
+
+func expectedAutopilotAction(autopilotCase string, class burstClass, configured string) string {
+	switch autopilotCase {
+	case "repartition":
+		return "repartition"
+	case "migration":
+		return "rebalance"
+	case "transient":
+		return "none"
+	default:
+		return class.expectation(configured)
+	}
+}
+
+func effectiveAutopilotCase(configured string, bundle *regionSnapshotBundle) string {
+	if configured == "migration" && !rebalanceTopology(bundle).ready {
+		return "repartition"
+	}
+	return configured
+}
+
+// parseAutopilotSchedule extracts the small set of timing knobs that are safe
+// to read from either a MetaSrv TOML file or an embedded Helm config block.
+// Unknown forms deliberately retain Enterprise defaults so a transient probe is
+// conservative instead of assuming it can outlive the scheduler's history.
+func parseAutopilotSchedule(snapshot string, defaults autopilotSchedule) autopilotSchedule {
+	for _, line := range strings.Split(snapshot, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), "\"'")
+		switch key {
+		case "sampling_window":
+			if duration, err := time.ParseDuration(value); err == nil && duration > 0 {
+				defaults.samplingWindow = duration
+			}
+		case "max_history_windows":
+			if windows, err := strconv.Atoi(value); err == nil && windows > 0 {
+				defaults.maxHistoryWindows = windows
+			}
+		case "min_samples":
+			if samples, err := strconv.Atoi(value); err == nil && samples > 0 {
+				defaults.repartitionSamples = samples
+			}
+		case "min_write_samples":
+			if samples, err := strconv.Atoi(value); err == nil && samples > 0 {
+				defaults.migrationMinSamples = samples
+			}
+		case "write_window_stability_threshold", "window_stability_threshold":
+			if windows, err := strconv.Atoi(value); err == nil && windows > 0 {
+				defaults.writeStableWindows = windows
+			}
+		}
+	}
+	return defaults
+}
+
+// stabilizationDuration is the minimum sustained plateau needed to replace
+// the complete cluster-stat history after a workload level changes. Enterprise
+// keeps one average per sampling window and rejects repartition when any
+// leader region's retained history is unstable.
+func (s autopilotSchedule) stabilizationDuration() time.Duration {
+	windows := max(s.maxHistoryWindows, s.repartitionSamples)
+	return time.Duration(windows+1) * s.samplingWindow
+}
+
+type burstPlan struct {
+	class           burstClass
+	duration        time.Duration
+	targetWriteBPS  float64
+	maximumWriteBPS float64
+	pressureScale   float64
+}
+
+func newBurstPlan(options periodicOptions, class burstClass, random *mathrand.Rand) burstPlan {
+	if class == burstClassTransient {
+		// Keep a transient below the source-derived history horizon. The final
+		// observation window is left out deliberately: a probe must not collect
+		// enough scheduler samples to become a stable scheduling candidate.
+		requiredWindows := max(options.AutopilotSchedule.repartitionSamples, options.AutopilotSchedule.migrationMinSamples, options.AutopilotSchedule.writeStableWindows)
+		maxDuration := time.Duration(max(requiredWindows-1, 1)) * options.AutopilotSchedule.samplingWindow
+		maxDuration -= options.BaselineTickInterval
+		if maxDuration < options.BaselineTickInterval {
+			maxDuration = options.BaselineTickInterval
+		}
+		maxDuration = min(options.TransientBurstDuration, maxDuration)
+		duration := options.BaselineTickInterval
+		if maxDuration > duration {
+			duration += time.Duration(random.Float64() * float64(maxDuration-duration))
+		}
+		scale := minTransientScale + random.Float64()*(maxTransientScale-minTransientScale)
+		return burstPlan{
+			class:           class,
+			duration:        duration,
+			targetWriteBPS:  options.PressureHighMinWriteBPS * scale,
+			maximumWriteBPS: options.PressureHighMinWriteBPS * maxTransientScale,
+			pressureScale:   scale,
+		}
+	}
+
+	scale := minPressureScale + random.Float64()*(maxPressureScale-minPressureScale)
+	duration := class.duration(options)
+	if options.AutopilotCase != "" && class == burstClassQualified {
+		duration = max(duration, options.AutopilotSchedule.stabilizationDuration())
+	}
+	return burstPlan{
+		class:           class,
+		duration:        duration,
+		targetWriteBPS:  class.initialTargetBPS(options) * scale,
+		maximumWriteBPS: options.QualifiedMaxWriteBPS * scale,
+		pressureScale:   scale,
+	}
 }
 
 func (c burstClass) duration(options periodicOptions) time.Duration {
@@ -586,6 +754,41 @@ func newBurstAmplifier(initial uint64) *burstAmplifier {
 	return &burstAmplifier{current: initial, max: max(initial*4, 256)}
 }
 
+func initialBurstAmplification(configured uint64, caseFocused bool) uint64 {
+	if caseFocused {
+		// A value-constrained pass produces only one partition-key value from
+		// the configured sample set. Start with enough passes to fill the
+		// global pacer in the first scheduler windows; otherwise the adaptive
+		// loop records several low, unstable samples before it can reach the
+		// requested pressure.
+		return max(configured, uint64(minCaseBurstPasses))
+	}
+	return configured
+}
+
+func activeBaselineTarget(options periodicOptions, plan burstPlan, caseFocused bool) float64 {
+	if !caseFocused {
+		return options.BaselineTargetWriteBPS
+	}
+	// Keep every region's write-throughput history non-zero and stable while
+	// reserving almost all of the active budget for the selected region. Auto
+	// repartition rejects a table if any region history is unstable; making
+	// non-target regions idle, or pacing them so slowly that their memtables
+	// drain between heartbeats, causes their WCU history to fail that gate.
+	return min(options.BaselineTargetWriteBPS, plan.targetWriteBPS*caseBaselineRatio)
+}
+
+// pressureAdjustmentFloor limits adaptation for an explicit scheduler case to
+// the configured high-pressure threshold. Chasing an aspirational client-side
+// target after that threshold is met keeps changing the region load and makes
+// the Enterprise stability gate reject the case indefinitely.
+func pressureAdjustmentFloor(threshold, configuredTarget float64, caseFocused bool) float64 {
+	if !caseFocused {
+		return configuredTarget
+	}
+	return min(configuredTarget, threshold*1.1)
+}
+
 func (a *burstAmplifier) value() uint64 {
 	if a == nil {
 		return 0
@@ -800,7 +1003,7 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	if len(logicalTables) == 1 {
 		logicalTable = logicalTables[0]
 	}
-	baseEvent := benchmarkEvent{RunID: runID, TargetDatabase: options.TargetDatabase, LogicalTable: logicalTable, PhysicalTable: options.TargetPhysicalTable, AutopilotExpect: options.AutopilotExpect, AutopilotConfigHash: options.AutopilotConfigHash, AutopilotConfigSnapshot: options.AutopilotConfigSnapshot, AnalysisContextIncomplete: options.AutopilotConfigSnapshot == ""}
+	baseEvent := benchmarkEvent{RunID: runID, TargetDatabase: options.TargetDatabase, LogicalTable: logicalTable, PhysicalTable: options.TargetPhysicalTable, AutopilotExpect: options.expectedAutopilotAction(options.BurstClass), AutopilotConfigHash: options.AutopilotConfigHash, AutopilotConfigSnapshot: options.AutopilotConfigSnapshot, AnalysisContextIncomplete: options.AutopilotConfigSnapshot == ""}
 	var writer *eventWriter
 	var snapshots *regionSnapshotStore
 	var refresher *regionRefresher
@@ -869,19 +1072,26 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	classScheduler := newBurstClassScheduler(options.BurstClass, random)
 	firstBurstAt := time.Now().Add(jitterDuration(options.BaselineDuration, options.BurstJitter, random))
 	emitLifecycle("run_started", eventWith(baseEvent, "run_started", "baseline", 0, func(event *benchmarkEvent) {
-		event.Details = fmt.Sprintf(`{"baseline_duration":"%s","baseline_tick_interval":"%s","burst_active_duration":"%s","transient_burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"burst_count":%d,"random_seed":%d,"observe_interval":"%s","periodic_traffic_mode":%q,"burst_class":%q,"baseline_target_write_bps":%g,"qualified_max_write_bps":%g,"pressure_high_min_write_bps":%g,"configured_logical_tables":%s}`, options.BaselineDuration, options.BaselineTickInterval, options.BurstActiveDuration, options.TransientBurstDuration, options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, options.BurstCount, seed, options.ObserveInterval, options.TrafficMode, options.BurstClass, options.BaselineTargetWriteBPS, options.QualifiedMaxWriteBPS, options.PressureHighMinWriteBPS, mustJSON(logicalTables))
+		event.Details = fmt.Sprintf(`{"baseline_duration":"%s","baseline_tick_interval":"%s","burst_active_duration":"%s","transient_burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"burst_count":%d,"random_seed":%d,"observe_interval":"%s","periodic_traffic_mode":%q,"burst_class":%q,"autopilot_case":%q,"baseline_target_write_bps":%g,"qualified_max_write_bps":%g,"pressure_high_min_write_bps":%g,"scheduler_sampling_window":"%s","scheduler_history_windows":%d,"scheduler_stabilization_duration":"%s","configured_logical_tables":%s}`, options.BaselineDuration, options.BaselineTickInterval, options.BurstActiveDuration, options.TransientBurstDuration, options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, options.BurstCount, seed, options.ObserveInterval, options.TrafficMode, options.BurstClass, options.AutopilotCase, options.BaselineTargetWriteBPS, options.QualifiedMaxWriteBPS, options.PressureHighMinWriteBPS, options.AutopilotSchedule.samplingWindow, options.AutopilotSchedule.maxHistoryWindows, options.AutopilotSchedule.stabilizationDuration(), mustJSON(logicalTables))
 	}), currentSnapshot(snapshots))
 	for cycle := uint64(1); options.BurstCount == 0 || cycle <= options.BurstCount; cycle++ {
 		class := classScheduler.next()
-		plannedTarget, targetOK := selectHotTarget(currentSnapshot(snapshots), random)
-		emitLifecycle("pressure_scheduled", plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, class, plannedTarget, targetOK, currentSnapshot(snapshots)), currentSnapshot(snapshots))
-		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, firstBurstAt, options.BaselineTickInterval, "baseline", 0, options, writer, snapshots, baseEvent, nil, burstClassTransient); err != nil {
+		plan := newBurstPlan(options, class, random)
+		caseKind := effectiveAutopilotCase(options.AutopilotCase, currentSnapshot(snapshots))
+		plannedTarget, targetOK := selectHotTarget(currentSnapshot(snapshots), random, caseKind)
+		if targetOK {
+			log.Printf("periodic-burst: planned case=%s cycle=%d class=%s expect=%s regions=%v label=%s values=%d target_bps=%.0f duration=%s scale=%.3f start=%s", caseName(caseKind), cycle, plan.class, expectedAutopilotAction(caseKind, plan.class, options.AutopilotExpect), hotTargetRegionIDs(plannedTarget), plannedTarget.labelName, len(plannedTarget.values()), plan.targetWriteBPS, plan.duration, plan.pressureScale, firstBurstAt.UTC().Format(time.RFC3339))
+		} else {
+			log.Printf("periodic-burst: planned case=%s cycle=%d class=%s expect=%s without an eligible region target; start=%s", caseName(caseKind), cycle, plan.class, expectedAutopilotAction(caseKind, plan.class, options.AutopilotExpect), firstBurstAt.UTC().Format(time.RFC3339))
+		}
+		emitLifecycle("pressure_scheduled", plannedBurstEvent(baseEvent, cycle, firstBurstAt, options, seed, caseKind, plan, plannedTarget, targetOK, currentSnapshot(snapshots)), currentSnapshot(snapshots))
+		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, firstBurstAt, options.BaselineTickInterval, "baseline", 0, options, writer, snapshots, baseEvent, nil, burstPlan{class: burstClassTransient}); err != nil {
 			return err
 		}
 		targetReselected := false
 		previousTarget := plannedTarget
 		if !hasHotTarget(currentSnapshot(snapshots), plannedTarget) {
-			plannedTarget, targetOK = selectHotTarget(currentSnapshot(snapshots), random)
+			plannedTarget, targetOK = selectHotTarget(currentSnapshot(snapshots), random, caseKind)
 			targetReselected = true
 		}
 		if writer != nil && targetReselected {
@@ -890,28 +1100,34 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 				event.Details = fmt.Sprintf(`{"reason":"partition_mapping_changed","previous_region_id":%d,"previous_label_name":%q,"previous_label_value":%q,"hot_label_name":%q,"hot_label_value":%q}`, previousTarget.regionID, previousTarget.labelName, previousTarget.labelValue, plannedTarget.labelName, plannedTarget.labelValue)
 			}), currentSnapshot(snapshots))
 		}
+		log.Printf("periodic-burst: starting case=%s cycle=%d class=%s expect=%s regions=%v", caseName(caseKind), cycle, plan.class, expectedAutopilotAction(caseKind, plan.class, options.AutopilotExpect), hotTargetRegionIDs(plannedTarget))
+		if targetOK && options.AutopilotCase != "" {
+			backgrounds := caseBackgroundPlan(fileConfigs, currentSnapshot(snapshots))
+			log.Printf("periodic-burst: scheduler baseline routes=%s", describeCaseBackgrounds(backgrounds))
+		}
 		if writer != nil {
 			emitLifecycle("pressure_started", eventWith(baseEvent, "pressure_started", "active", cycle, func(event *benchmarkEvent) {
 				now := time.Now()
 				event.ScheduledTSMS = firstBurstAt.UnixMilli()
 				event.ActualTSMS = now.UnixMilli()
-				event.BurstClass = string(class)
-				event.AutopilotExpect = class.expectation(options.AutopilotExpect)
-				event.PressureThresholdBPS = floatEventValue(class.initialTargetBPS(options))
+				event.BurstClass = string(plan.class)
+				event.AutopilotExpect = expectedAutopilotAction(caseKind, plan.class, options.AutopilotExpect)
+				event.PressureThresholdBPS = floatEventValue(plan.targetWriteBPS)
 				if targetOK {
 					event.RegionID = plannedTarget.regionID
-					event.Details = fmt.Sprintf(`{"hot_label_name":%q,"hot_label_value":%q,"burst_class":%q,"target_write_bps":%g}`, plannedTarget.labelName, plannedTarget.labelValue, class, class.initialTargetBPS(options))
+					event.Details = fmt.Sprintf(`{"hot_label_name":%q,"hot_label_values":%s,"hot_region_ids":%s,"burst_class":%q,"autopilot_case":%q,"burst_duration":"%s","pressure_scale":%g,"target_write_bps":%g}`, plannedTarget.labelName, mustJSON(plannedTarget.values()), mustJSON(hotTargetRegionIDs(plannedTarget)), plan.class, caseKind, plan.duration, plan.pressureScale, plan.targetWriteBPS)
 				}
 			}), currentSnapshot(snapshots))
 		}
-		activeDeadline := time.Now().Add(class.duration(options))
+		activeDeadline := time.Now().Add(plan.duration)
 		var target *hotTarget
 		if targetOK {
 			target = &plannedTarget
 		}
-		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, activeDeadline, s.TickInterval, "active", cycle, options, writer, snapshots, baseEvent, target, class); err != nil {
+		if err := s.runPeriodicWrites(ctx, fileConfigs, &current, churnEpochGenerator, activeDeadline, s.TickInterval, "active", cycle, options, writer, snapshots, baseEvent, target, plan); err != nil {
 			return err
 		}
+		log.Printf("periodic-burst: completed case=%s cycle=%d class=%s", caseName(caseKind), cycle, plan.class)
 		if writer != nil {
 			emitWithCurrentSnapshot(writer, ctx, eventWith(baseEvent, "phase_completed", "active", cycle, func(event *benchmarkEvent) {
 				event.Details = "active requests drained"
@@ -932,6 +1148,13 @@ func (s *SampleLoader) runPeriodic(cmd *cobra.Command, fileConfigs []samples.Fil
 	return nil
 }
 
+func caseName(autopilotCase string) string {
+	if autopilotCase == "" {
+		return "legacy"
+	}
+	return autopilotCase
+}
+
 func nextBurstStart(options periodicOptions, previousStart, activeFinished time.Time, random *mathrand.Rand) time.Time {
 	if options.TrafficMode == "steady" {
 		return activeFinished.Add(options.BurstGap)
@@ -943,10 +1166,16 @@ func nextBurstStart(options periodicOptions, previousStart, activeFinished time.
 	return next
 }
 
-func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, deadline time.Time, tickInterval time.Duration, phase string, cycle uint64, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, target *hotTarget, class burstClass) error {
+func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samples.FileConfig, current *time.Time, churn *samples.ChurnEpochGenerator, deadline time.Time, tickInterval time.Duration, phase string, cycle uint64, options periodicOptions, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, target *hotTarget, plan burstPlan) error {
 	phaseCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	caseFocused := phase == "active" && target != nil && options.AutopilotCase != ""
 	requests := make(chan periodicWriteRequest, s.Workers)
+	baselineRequests := requests
+	dedicatedBaselineLane := caseFocused && s.Workers > 1
+	if dedicatedBaselineLane {
+		baselineRequests = make(chan periodicWriteRequest, 1)
+	}
 	results := make(chan writeResult, s.Workers*2)
 	collector := &workloadCollector{}
 	collectorDone := make(chan struct{})
@@ -962,18 +1191,46 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 	var hotspotPacer *bytePacer
 	var amplifier *burstAmplifier
 	if options.TrafficMode == "steady" {
-		baselinePacer = newBytePacer(options.BaselineTargetWriteBPS)
-		if phase == "active" && target != nil && class == burstClassQualified {
-			hotspotPacer = newBytePacer(max(class.initialTargetBPS(options)-options.BaselineTargetWriteBPS, 0))
-			amplifier = newBurstAmplifier(options.BurstAmplification)
+		// An explicit scheduler case makes one selected region observably hotter
+		// than the rest of the table. It keeps a deliberately small global
+		// baseline so every region has stable history for the Enterprise
+		// baseline gate.
+		baselinePacer = newBytePacer(activeBaselineTarget(options, plan, caseFocused))
+		if phase == "active" && target != nil {
+			hotspotTarget := max(plan.targetWriteBPS-baselinePacer.target(), 0)
+			hotspotPacer = newBytePacer(hotspotTarget)
+			amplifier = newBurstAmplifier(initialBurstAmplification(options.BurstAmplification, caseFocused))
 		}
 	}
-	for i := 0; i < s.Workers; i++ {
+	if dedicatedBaselineLane {
+		workers.Add(1)
+		go periodicWorker(ctx, s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, baselineRequests, results, &workers, s.DryRun)
+	}
+	hotspotWorkers := s.Workers
+	if dedicatedBaselineLane {
+		hotspotWorkers--
+	}
+	for range hotspotWorkers {
 		workers.Add(1)
 		go periodicWorker(ctx, s.RemoteWriteURL, s.authorizationHeader(), options.TargetPhysicalTable, requests, results, &workers, s.DryRun)
 	}
 
 	started := time.Now()
+	// Each current region gets an independent pacer. Sharing one pacer makes a
+	// large representative config delay the other regions, producing sparse,
+	// uneven heartbeat samples that the Enterprise baseline gate rejects.
+	backgroundPacers := make(map[uint64]*bytePacer)
+	backgroundPacer := func(regionID uint64, regionCount int) *bytePacer {
+		if baselinePacer == nil || regionCount == 0 {
+			return nil
+		}
+		if pacer := backgroundPacers[regionID]; pacer != nil {
+			return pacer
+		}
+		pacer := newBytePacer(baselinePacer.target() / float64(regionCount))
+		backgroundPacers[regionID] = pacer
+		return pacer
+	}
 	windowInterval := workloadWindowInterval
 	if options.TrafficMode == "steady" {
 		// In steady mode the configured scrape cadence is also the observation
@@ -992,6 +1249,87 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 	go func() {
 		defer close(producerDone)
 		defer close(requests)
+		if dedicatedBaselineLane {
+			defer close(baselineRequests)
+		}
+		if caseFocused && dedicatedBaselineLane {
+			// The target generator can take longer than one scrape interval to
+			// build a high-cardinality hot pass. Keep the all-region baseline in a
+			// separate producer as well as a separate worker; otherwise it emits
+			// only once before the hot pass monopolizes this loop and its regions
+			// decay to zero in MetaSrv heartbeat history.
+			var currentMu sync.Mutex
+			nextTimestamp := func() time.Time {
+				currentMu.Lock()
+				defer currentMu.Unlock()
+				timestamp := *current
+				*current = current.Add(s.Interval)
+				return timestamp
+			}
+			var generators sync.WaitGroup
+			generators.Add(1)
+			go func() {
+				defer generators.Done()
+				tick := time.NewTicker(tickInterval)
+				defer tick.Stop()
+				for {
+					epoch := churn.GetChurnEpoch()
+					backgrounds := caseBackgroundPlan(fileConfigs, currentSnapshot(snapshots))
+					timestamp := nextTimestamp()
+					for _, background := range backgrounds {
+						values := background.target.values()
+						if len(values) == 0 {
+							continue
+						}
+						pacer := backgroundPacer(background.target.regionID, len(backgrounds))
+						if !enqueuePeriodicRequests(phaseCtx, baselineRequests, baselineTrafficLane, pacer, func(raw chan<- prompb.WriteRequest) bool {
+							return s.convertToRemoteWriteRequestsStreamingWithLabelValues(phaseCtx, []samples.FileConfig{background.fileConfig}, timestamp, raw, epoch, map[string]string{background.target.labelName: values[0]}, nil)
+						}) {
+							return
+						}
+					}
+					select {
+					case <-phaseCtx.Done():
+						return
+					case <-tick.C:
+					}
+				}
+			}()
+			generators.Add(1)
+			go func() {
+				defer generators.Done()
+				tick := time.NewTicker(tickInterval)
+				defer tick.Stop()
+				for {
+					epoch := churn.GetChurnEpoch()
+					targets := target.workloadTargets()
+					if len(targets) == 0 {
+						return
+					}
+					for pass := range amplifier.value() {
+						selectedTarget := targets[pass%uint64(len(targets))]
+						values := selectedTarget.values()
+						if len(values) == 0 {
+							continue
+						}
+						labelValue := values[(pass/uint64(len(targets)))%uint64(len(values))]
+						timestamp := nextTimestamp()
+						if !enqueuePeriodicRequests(phaseCtx, requests, hotspotTrafficLane, hotspotPacer, func(raw chan<- prompb.WriteRequest) bool {
+							return s.convertToRemoteWriteRequestsStreamingWithLabelValues(phaseCtx, fileConfigs, timestamp, raw, epoch, map[string]string{selectedTarget.labelName: labelValue}, nil)
+						}) {
+							return
+						}
+					}
+					select {
+					case <-phaseCtx.Done():
+						return
+					case <-tick.C:
+					}
+				}
+			}()
+			generators.Wait()
+			return
+		}
 		tick := time.NewTicker(tickInterval)
 		defer tick.Stop()
 		generate := func() {
@@ -1024,21 +1362,50 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 				return
 			}
 
-			// A steady active phase keeps the normal config-derived baseline and
-			// adds only the selected partition value as extra traffic.
-			if !enqueuePeriodicRequests(phaseCtx, requests, baselineTrafficLane, baselinePacer, func(raw chan<- prompb.WriteRequest) bool {
+			if caseFocused {
+				backgrounds := caseBackgroundPlan(fileConfigs, currentSnapshot(snapshots))
+				for _, background := range backgrounds {
+					values := background.target.values()
+					if len(values) == 0 {
+						continue
+					}
+					pacer := backgroundPacer(background.target.regionID, len(backgrounds))
+					if !enqueuePeriodicRequests(phaseCtx, baselineRequests, baselineTrafficLane, pacer, func(raw chan<- prompb.WriteRequest) bool {
+						return s.convertToRemoteWriteRequestsStreamingWithLabelValues(phaseCtx, []samples.FileConfig{background.fileConfig}, *current, raw, epoch, map[string]string{background.target.labelName: values[0]}, nil)
+					}) {
+						return
+					}
+				}
+			} else if !enqueuePeriodicRequests(phaseCtx, baselineRequests, baselineTrafficLane, baselinePacer, func(raw chan<- prompb.WriteRequest) bool {
 				return s.convertToRemoteWriteRequestsStreaming(phaseCtx, fileConfigs, *current, raw, epoch)
 			}) {
 				return
 			}
 			*current = current.Add(s.Interval)
+
+			// The active phase keeps the normal config-derived baseline and adds a
+			// target-region lane. An explicit case uses a representative config
+			// sample for its low baseline so that it does not delay this lane;
+			// legacy/static expectations retain the full configured baseline.
+			// Cycling values makes repartition input span the region's partition
+			// key range instead of concentrating every new row on one identical key.
 			if hotspotPacer == nil {
 				return
 			}
+			targets := target.workloadTargets()
+			if len(targets) == 0 {
+				return
+			}
 			repetitions := amplifier.value()
-			for range repetitions {
+			for pass := range repetitions {
+				selectedTarget := targets[pass%uint64(len(targets))]
+				values := selectedTarget.values()
+				if len(values) == 0 {
+					continue
+				}
+				labelValue := values[(pass/uint64(len(targets)))%uint64(len(values))]
 				if !enqueuePeriodicRequests(phaseCtx, requests, hotspotTrafficLane, hotspotPacer, func(raw chan<- prompb.WriteRequest) bool {
-					return s.convertToRemoteWriteRequestsStreamingWithLabelValues(phaseCtx, fileConfigs, *current, raw, epoch, map[string]string{target.labelName: target.labelValue}, nil)
+					return s.convertToRemoteWriteRequestsStreamingWithLabelValues(phaseCtx, fileConfigs, *current, raw, epoch, map[string]string{selectedTarget.labelName: labelValue}, nil)
 				}) {
 					return
 				}
@@ -1073,16 +1440,16 @@ func (s *SampleLoader) runPeriodicWrites(ctx context.Context, fileConfigs []samp
 				return err
 			}
 			now := time.Now()
-			emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, baselinePacer, hotspotPacer, amplifier, class, options.QualifiedMaxWriteBPS)
+			emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, baselinePacer, hotspotPacer, amplifier, plan, caseFocused)
 			return nil
 		case now := <-window.C:
-			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, baselinePacer, hotspotPacer, amplifier, class, options.QualifiedMaxWriteBPS)
+			consecutiveHigh = emitWorkloadWindow(ctx, writer, snapshots, base, phase, cycle, windowStarted, now, collector.reset(), options.PressureHighMinWriteBPS, consecutiveHigh, baselinePacer, hotspotPacer, amplifier, plan, caseFocused)
 			windowStarted = now
 		}
 	}
 }
 
-func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, phase string, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64, baselinePacer, hotspotPacer *bytePacer, amplifier *burstAmplifier, class burstClass, qualifiedMaxWriteBPS float64) uint64 {
+func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *regionSnapshotStore, base benchmarkEvent, phase string, cycle uint64, start, end time.Time, metrics workloadMetrics, threshold float64, consecutiveHigh uint64, baselinePacer, hotspotPacer *bytePacer, amplifier *burstAmplifier, plan burstPlan, caseFocused bool) uint64 {
 	if writer == nil || !end.After(start) {
 		return consecutiveHigh
 	}
@@ -1103,7 +1470,7 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *reg
 		event.LatencyP95MS = floatEventValue(latencyPercentileMS(latencies, 0.95))
 		event.LatencyMaxMS = floatEventValue(latencyPercentileMS(latencies, 1))
 		event.PressureThresholdBPS = floatEventValue(threshold)
-		event.BurstClass = string(class)
+		event.BurstClass = string(plan.class)
 		baselineTarget := baselinePacer.target()
 		hotspotTarget := hotspotPacer.target()
 		if baselineTarget > 0 || hotspotTarget > 0 {
@@ -1114,40 +1481,51 @@ func emitWorkloadWindow(ctx context.Context, writer *eventWriter, snapshots *reg
 		consecutiveHigh++
 	} else {
 		if consecutiveHigh >= 3 {
-			emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_dropped", phase, cycle, func(event *benchmarkEvent) {
+			if err := emitWithCurrentSnapshotAndFlush(writer, ctx, eventWith(base, "pressure_dropped", phase, cycle, func(event *benchmarkEvent) {
 				event.WriteBPS = floatEventValue(writeBPS)
 				event.PressureThresholdBPS = floatEventValue(threshold)
 				event.ConsecutiveHighWindows = consecutiveHigh
-			}), snapshots)
+			}), snapshots); err != nil {
+				log.Printf("periodic-burst: flush pressure_dropped event: %v", err)
+			}
 		}
 		consecutiveHigh = 0
 	}
 	event.ConsecutiveHighWindows = consecutiveHigh
-	emitWithCurrentSnapshot(writer, ctx, event, snapshots)
+	if err := emitWithCurrentSnapshotAndFlush(writer, ctx, event, snapshots); err != nil {
+		log.Printf("periodic-burst: flush workload_window event: %v", err)
+	}
 	if metrics.errorCount > 0 {
-		emitWithCurrentSnapshot(writer, ctx, eventWith(base, "write_error", phase, cycle, func(event *benchmarkEvent) {
+		if err := emitWithCurrentSnapshotAndFlush(writer, ctx, eventWith(base, "write_error", phase, cycle, func(event *benchmarkEvent) {
 			event.WindowStartMS = start.UnixMilli()
 			event.WindowEndMS = end.UnixMilli()
 			event.ErrorCount = metrics.errorCount
 			event.Error = metrics.lastError
-		}), snapshots)
+		}), snapshots); err != nil {
+			log.Printf("periodic-burst: flush write_error event: %v", err)
+		}
 	}
 	if consecutiveHigh == 3 {
-		emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_observed_high", phase, cycle, func(event *benchmarkEvent) {
+		if err := emitWithCurrentSnapshotAndFlush(writer, ctx, eventWith(base, "pressure_observed_high", phase, cycle, func(event *benchmarkEvent) {
 			event.WriteBPS = floatEventValue(writeBPS)
 			event.PressureThresholdBPS = floatEventValue(threshold)
 			event.ConsecutiveHighWindows = consecutiveHigh
-		}), snapshots)
+		}), snapshots); err != nil {
+			log.Printf("periodic-burst: flush pressure_observed_high event: %v", err)
+		}
 	}
-	if phase == "active" && class == burstClassQualified && metrics.errorCount == 0 && hotspotPacer != nil && writeBPS < (baselinePacer.target()+hotspotPacer.target())*0.9 {
-		if hotspotTarget, increased := hotspotPacer.increase(max(qualifiedMaxWriteBPS-baselinePacer.target(), 0)); increased {
+	adjustmentFloor := pressureAdjustmentFloor(threshold, baselinePacer.target()+hotspotPacer.target(), caseFocused)
+	if phase == "active" && plan.class == burstClassQualified && metrics.errorCount == 0 && hotspotPacer != nil && writeBPS < adjustmentFloor*0.9 {
+		if hotspotTarget, increased := hotspotPacer.increase(max(plan.maximumWriteBPS-baselinePacer.target(), 0)); increased {
 			sourcePasses, _ := amplifier.increase()
-			emitWithCurrentSnapshot(writer, ctx, eventWith(base, "pressure_rate_adjusted", phase, cycle, func(event *benchmarkEvent) {
-				event.BurstClass = string(class)
+			if err := emitWithCurrentSnapshotAndFlush(writer, ctx, eventWith(base, "pressure_rate_adjusted", phase, cycle, func(event *benchmarkEvent) {
+				event.BurstClass = string(plan.class)
 				event.WriteBPS = floatEventValue(writeBPS)
 				event.PressureThresholdBPS = floatEventValue(baselinePacer.target() + hotspotTarget)
-				event.Details = fmt.Sprintf(`{"reason":"observed_below_target","new_target_write_bps":%g,"baseline_target_write_bps":%g,"hotspot_target_write_bps":%g,"max_target_write_bps":%g,"source_passes":%d}`, baselinePacer.target()+hotspotTarget, baselinePacer.target(), hotspotTarget, qualifiedMaxWriteBPS, sourcePasses)
-			}), snapshots)
+				event.Details = fmt.Sprintf(`{"reason":"observed_below_target","new_target_write_bps":%g,"baseline_target_write_bps":%g,"hotspot_target_write_bps":%g,"max_target_write_bps":%g,"pressure_scale":%g,"source_passes":%d}`, baselinePacer.target()+hotspotTarget, baselinePacer.target(), hotspotTarget, plan.maximumWriteBPS, plan.pressureScale, sourcePasses)
+			}), snapshots); err != nil {
+				log.Printf("periodic-burst: flush pressure_rate_adjusted event: %v", err)
+			}
 		}
 	}
 	return consecutiveHigh
@@ -1159,6 +1537,25 @@ func emitWithCurrentSnapshot(writer *eventWriter, ctx context.Context, event ben
 		return
 	}
 	writer.emitWithSnapshot(ctx, event, snapshots.get())
+}
+
+// emitWithCurrentSnapshotAndFlush persists high-signal workload evidence on
+// the same cadence that it is observed. Unlike lifecycle emission it does not
+// replay every region-stat event already attached to the snapshot; this keeps
+// the self-monitoring stream compact while letting Grafana and agents inspect
+// a live case before it completes.
+func emitWithCurrentSnapshotAndFlush(writer *eventWriter, ctx context.Context, event benchmarkEvent, snapshots *regionSnapshotStore) error {
+	if snapshots == nil {
+		return writer.emitAndFlush(ctx, event)
+	}
+	bundle := snapshots.get()
+	if bundle == nil {
+		return writer.emitAndFlush(ctx, event)
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	writer.appendLocked(withSnapshotDetails(event, bundle))
+	return writer.flushLocked(ctx)
 }
 
 func mustJSON(value any) string {
@@ -1212,18 +1609,20 @@ func jitterDuration(duration time.Duration, jitter float64, random *mathrand.Ran
 	return time.Duration(float64(duration) * factor)
 }
 
-func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, options periodicOptions, seed int64, class burstClass, target hotTarget, targetOK bool, snapshot *regionSnapshotBundle) benchmarkEvent {
+func plannedBurstEvent(base benchmarkEvent, cycle uint64, scheduled time.Time, options periodicOptions, seed int64, autopilotCase string, plan burstPlan, target hotTarget, targetOK bool, snapshot *regionSnapshotBundle) benchmarkEvent {
 	return eventWith(base, "pressure_scheduled", "baseline", cycle, func(event *benchmarkEvent) {
 		event.ScheduledTSMS = scheduled.UnixMilli()
-		event.BurstClass = string(class)
-		event.AutopilotExpect = class.expectation(options.AutopilotExpect)
-		event.PressureThresholdBPS = floatEventValue(class.initialTargetBPS(options))
+		event.BurstClass = string(plan.class)
+		event.AutopilotExpect = expectedAutopilotAction(autopilotCase, plan.class, options.AutopilotExpect)
+		event.PressureThresholdBPS = floatEventValue(plan.targetWriteBPS)
 		topology := rebalanceTopology(snapshot)
 		if targetOK {
 			event.RegionID = target.regionID
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_label_name":%q,"hot_label_value":%q,"available_region_count":%d,"observed_leader_datanode_count":%d,"rebalance_region_surplus":%d,"rebalance_topology_ready":%t}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), target.labelName, target.labelValue, topology.regionCount, topology.datanodeCount, topology.regionSurplus, topology.ready)
+			splitInputReady := autopilotCase != "repartition" || len(target.values()) >= 2
+			bootstrap := options.AutopilotCase == "migration" && autopilotCase == "repartition"
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"autopilot_case":%q,"migration_bootstrap_repartition":%t,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"pressure_scale":%g,"target_write_bps":%g,"max_target_write_bps":%g,"hot_label_name":%q,"hot_label_values":%s,"hot_label_value_count":%d,"repartition_split_input_ready":%t,"autopilot_sampling_window":"%s","repartition_min_samples":%d,"migration_min_samples":%d,"migration_stable_windows":%d,"available_region_count":%d,"observed_leader_datanode_count":%d,"rebalance_region_surplus":%d,"rebalance_topology_ready":%t}`, seed, plan.class, autopilotCase, bootstrap, plan.duration, options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, plan.pressureScale, plan.targetWriteBPS, plan.maximumWriteBPS, target.labelName, mustJSON(target.values()), len(target.values()), splitInputReady, options.AutopilotSchedule.samplingWindow, options.AutopilotSchedule.repartitionSamples, options.AutopilotSchedule.migrationMinSamples, options.AutopilotSchedule.writeStableWindows, topology.regionCount, topology.datanodeCount, topology.regionSurplus, topology.ready)
 		} else {
-			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"target_write_bps":%g,"hot_target_unavailable":true,"available_region_count":%d,"observed_leader_datanode_count":%d,"rebalance_region_surplus":%d,"rebalance_topology_ready":%t}`, seed, class, class.duration(options), options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, class.initialTargetBPS(options), topology.regionCount, topology.datanodeCount, topology.regionSurplus, topology.ready)
+			event.Details = fmt.Sprintf(`{"random_seed":%d,"burst_class":%q,"autopilot_case":%q,"burst_duration":"%s","burst_period":"%s","burst_gap":"%s","burst_jitter":%g,"burst_amplification":%d,"pressure_scale":%g,"target_write_bps":%g,"max_target_write_bps":%g,"hot_target_unavailable":true,"available_region_count":%d,"observed_leader_datanode_count":%d,"rebalance_region_surplus":%d,"rebalance_topology_ready":%t}`, seed, plan.class, autopilotCase, plan.duration, options.BurstPeriod, options.BurstGap, options.BurstJitter, options.BurstAmplification, plan.pressureScale, plan.targetWriteBPS, plan.maximumWriteBPS, topology.regionCount, topology.datanodeCount, topology.regionSurplus, topology.ready)
 		}
 	})
 }
@@ -1268,6 +1667,7 @@ type regionSnapshotBundle struct {
 	distribution   []sharedpartition.RegionDistribution
 	logicalTables  []string
 	hotTargets     []hotTarget
+	datanodeCount  uint64
 	refreshError   string
 	stale          bool
 }
@@ -1299,7 +1699,10 @@ func rebalanceTopology(bundle *regionSnapshotBundle) rebalanceTopologySummary {
 		}
 	}
 	regionCount := uint64(len(seenRegions))
-	datanodeCount := uint64(len(leaders))
+	datanodeCount := bundle.datanodeCount
+	if datanodeCount == 0 {
+		datanodeCount = uint64(len(leaders))
+	}
 	surplus := int64(regionCount) - int64(datanodeCount)
 	return rebalanceTopologySummary{
 		regionCount:   regionCount,
@@ -1309,11 +1712,51 @@ func rebalanceTopology(bundle *regionSnapshotBundle) rebalanceTopologySummary {
 	}
 }
 
-// hotTarget is a config-derived label value that routes writes to one current region.
+// hotTarget is a config-derived label-value set that routes writes to one current region.
+// Repartition needs multiple values within the region so the scheduler can sample
+// a real split boundary instead of repeatedly observing one identical key.
 type hotTarget struct {
-	regionID   uint64
-	labelName  string
-	labelValue string
+	regionID    uint64
+	labelName   string
+	labelValue  string
+	labelValues []string
+	// members is populated only for a migration case.  Region balancing must
+	// move one reasonably sized region off an already hot datanode; making a
+	// single region overwhelmingly hot cannot improve the balance after moving
+	// it.  Keep the public planning shape as one hotTarget while carrying the
+	// colocated regions that form the migration workload.
+	members []hotTarget
+}
+
+func (t hotTarget) values() []string {
+	if len(t.labelValues) != 0 {
+		return t.labelValues
+	}
+	if t.labelValue == "" {
+		return nil
+	}
+	return []string{t.labelValue}
+}
+
+func (t hotTarget) workloadTargets() []hotTarget {
+	if len(t.members) != 0 {
+		return t.members
+	}
+	return []hotTarget{{
+		regionID:    t.regionID,
+		labelName:   t.labelName,
+		labelValue:  t.labelValue,
+		labelValues: append([]string(nil), t.labelValues...),
+	}}
+}
+
+func hotTargetRegionIDs(target hotTarget) []uint64 {
+	targets := target.workloadTargets()
+	ids := make([]uint64, 0, len(targets))
+	for _, item := range targets {
+		ids = append(ids, item.regionID)
+	}
+	return ids
 }
 
 type regionSnapshotStore struct {
@@ -1381,47 +1824,245 @@ func configHotTargets(definition sharedpartition.PartitionDefinition, metadata [
 		return nil
 	}
 	labelName := definition.Columns[0]
-	seen := make(map[string]struct{})
-	targets := make([]hotTarget, 0)
+	byRegion := make(map[string]*hotTarget)
 	for _, table := range tables {
 		for _, value := range table.LabelValues[labelName] {
 			item, _, ok := sharedpartition.FindMetadataByColumnValue(definition, metadata, labelName, value)
 			if !ok || item.RegionID == 0 {
 				continue
 			}
-			key := fmt.Sprintf("%d/%s/%s", item.RegionID, labelName, value)
-			if _, exists := seen[key]; exists {
-				continue
+			key := fmt.Sprintf("%d/%s", item.RegionID, labelName)
+			target := byRegion[key]
+			if target == nil {
+				target = &hotTarget{regionID: item.RegionID, labelName: labelName}
+				byRegion[key] = target
 			}
-			seen[key] = struct{}{}
-			targets = append(targets, hotTarget{regionID: item.RegionID, labelName: labelName, labelValue: value})
+			if !containsHotTargetValue(target.labelValues, value) {
+				target.labelValues = append(target.labelValues, value)
+			}
 		}
 	}
+	targets := make([]hotTarget, 0, len(byRegion))
+	for _, target := range byRegion {
+		sort.Strings(target.labelValues)
+		if len(target.labelValues) != 0 {
+			target.labelValue = target.labelValues[0]
+		}
+		targets = append(targets, *target)
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].regionID < targets[j].regionID })
 	return targets
 }
 
-func selectHotTarget(bundle *regionSnapshotBundle, random *mathrand.Rand) (hotTarget, bool) {
+func selectHotTarget(bundle *regionSnapshotBundle, random *mathrand.Rand, autopilotCase string) (hotTarget, bool) {
 	if bundle == nil || len(bundle.hotTargets) == 0 {
 		return hotTarget{}, false
 	}
-	return bundle.hotTargets[random.Intn(len(bundle.hotTargets))], true
+	candidates := bundle.hotTargets
+	if autopilotCase == "repartition" {
+		candidates = make([]hotTarget, 0, len(bundle.hotTargets))
+		for _, target := range bundle.hotTargets {
+			if len(target.values()) >= 2 {
+				candidates = append(candidates, target)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return hotTarget{}, false
+	}
+	if autopilotCase == "migration" {
+		leaders := make(map[uint64]string, len(bundle.snapshots))
+		for _, snapshot := range bundle.snapshots {
+			if snapshot.regionID != 0 && snapshot.leader != "" {
+				leaders[snapshot.regionID] = snapshot.leader
+			}
+		}
+		byLeader := make(map[string][]hotTarget)
+		for _, candidate := range candidates {
+			if leader := leaders[candidate.regionID]; leader != "" {
+				byLeader[leader] = append(byLeader[leader], candidate)
+			}
+		}
+		groups := make([][]hotTarget, 0, len(byLeader))
+		for _, group := range byLeader {
+			if len(group) < 2 {
+				continue
+			}
+			sort.Slice(group, func(i, j int) bool { return group[i].regionID < group[j].regionID })
+			groups = append(groups, group)
+		}
+		if len(groups) == 0 {
+			return hotTarget{}, false
+		}
+		group := groups[random.Intn(len(groups))]
+		selectedMembers := balancedMigrationTargets(group, bundle.distribution)
+		selected := selectedMembers[0]
+		selected.members = selectedMembers
+		return selected, true
+	}
+	return candidates[random.Intn(len(candidates))], true
+}
+
+// balancedMigrationTargets chooses two regions already led by the same
+// datanode whose configured series counts are closest.  A migration moves one
+// whole region, so a pair with comparable input volume produces an imbalance
+// that a single move can actually improve.  Loading every colocated region can
+// make one very large region dominate and leaves the balancer with no valid
+// move despite a high node total.
+func balancedMigrationTargets(group []hotTarget, distribution []sharedpartition.RegionDistribution) []hotTarget {
+	if len(group) <= 2 {
+		return append([]hotTarget(nil), group...)
+	}
+	series := make(map[uint64]uint64, len(distribution))
+	for _, item := range distribution {
+		if item.RegionID != 0 && !item.Unresolved && item.SeriesCount != 0 {
+			series[item.RegionID] = item.SeriesCount
+		}
+	}
+	bestLeft, bestRight := 0, 1
+	bestRatio := math.Inf(1)
+	for left := 0; left < len(group); left++ {
+		leftSeries := series[group[left].regionID]
+		if leftSeries == 0 {
+			continue
+		}
+		for right := left + 1; right < len(group); right++ {
+			rightSeries := series[group[right].regionID]
+			if rightSeries == 0 {
+				continue
+			}
+			ratio := math.Abs(math.Log(float64(leftSeries) / float64(rightSeries)))
+			if ratio < bestRatio {
+				bestLeft, bestRight, bestRatio = left, right, ratio
+			}
+		}
+	}
+	return []hotTarget{group[bestLeft], group[bestRight]}
+}
+
+type caseBackground struct {
+	fileConfig samples.FileConfig
+	target     hotTarget
+}
+
+func describeCaseBackgrounds(backgrounds []caseBackground) string {
+	if len(backgrounds) == 0 {
+		return "none"
+	}
+	routes := make([]string, 0, len(backgrounds))
+	for _, background := range backgrounds {
+		values := background.target.values()
+		value := ""
+		if len(values) > 0 {
+			value = values[0]
+		}
+		routes = append(routes, fmt.Sprintf("region=%d %s=%s config=%s series=%d", background.target.regionID, background.target.labelName, value, background.fileConfig.Name, background.fileConfig.SeriesCount))
+	}
+	return strings.Join(routes, "; ")
+}
+
+// caseBackgroundPlan chooses existing configs that can produce one
+// representative value for every current partition-key region. The active
+// case sends only these small config-derived samples on the baseline lane, so
+// non-target regions retain stable scheduler history without delaying the
+// concentrated hotspot lane behind a full-table scan.
+func caseBackgroundPlan(fileConfigs []samples.FileConfig, bundle *regionSnapshotBundle) []caseBackground {
+	if bundle == nil || len(bundle.hotTargets) == 0 {
+		return nil
+	}
+	targets := make([]hotTarget, 0, len(bundle.hotTargets))
+	for _, target := range bundle.hotTargets {
+		if len(target.values()) == 0 {
+			continue
+		}
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	backgrounds := make([]caseBackground, 0, len(targets))
+	for _, target := range targets {
+		wanted := map[string]struct{}{target.values()[0]: {}}
+		var selected *samples.FileConfig
+		for index := range fileConfigs {
+			candidate := &fileConfigs[index]
+			if configSupportsLabelValues(candidate, target.labelName, wanted) && (selected == nil || candidate.SeriesCount > selected.SeriesCount) {
+				selected = candidate
+			}
+		}
+		if selected != nil {
+			// FieldGenerators is a mutable per-series cache. The hotspot may use
+			// the selected config concurrently, so background generation must not
+			// share or even read that map (or a concurrent read/write panic results).
+			backgrounds = append(backgrounds, caseBackground{fileConfig: backgroundFileConfig(selected), target: target})
+		}
+	}
+	return backgrounds
+}
+
+// backgroundFileConfig copies only immutable generation inputs. FileConfig's
+// FieldGenerators is an unsynchronized mutable cache populated by hotspot
+// generation, so a struct copy would race merely while reading that map field.
+func backgroundFileConfig(source *samples.FileConfig) samples.FileConfig {
+	return samples.FileConfig{
+		Name:               source.Name,
+		Config:             source.Config,
+		ReplicaInsertIndex: source.ReplicaInsertIndex,
+		SeriesCount:        source.SeriesCount,
+		ChurnIndices:       append([]int(nil), source.ChurnIndices...),
+	}
+}
+
+func configSupportsLabelValues(fileConfig *samples.FileConfig, labelName string, wanted map[string]struct{}) bool {
+	for _, tag := range fileConfig.Config.Tags {
+		if tag.Name != labelName {
+			continue
+		}
+		available := make(map[string]struct{})
+		for _, value := range tag.Dist.LabelGenerator().All() {
+			available[value] = struct{}{}
+		}
+		for value := range wanted {
+			if _, ok := available[value]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func hasHotTarget(bundle *regionSnapshotBundle, target hotTarget) bool {
 	if bundle == nil {
 		return false
 	}
-	for _, current := range bundle.hotTargets {
-		if current == target {
+	for _, expected := range target.workloadTargets() {
+		found := false
+		for _, current := range bundle.hotTargets {
+			if current.regionID == expected.regionID && current.labelName == expected.labelName && containsHotTargetValue(current.values(), expected.labelValue) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesHotTarget(series prompb.TimeSeries, target hotTarget) bool {
+	for _, label := range series.Labels {
+		if label.Name == target.labelName && containsHotTargetValue(target.values(), label.Value) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchesHotTarget(series prompb.TimeSeries, target hotTarget) bool {
-	for _, label := range series.Labels {
-		if label.Name == target.labelName && label.Value == target.labelValue {
+func containsHotTargetValue(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
 			return true
 		}
 	}
@@ -1445,6 +2086,10 @@ func (r *regionRefresher) refresh(ctx context.Context) (*regionSnapshotBundle, [
 	if err != nil {
 		return nil, nil, err
 	}
+	datanodeCount, err := r.client.activeDatanodeCount(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("query active datanodes from information_schema.cluster_info: %w", err)
+	}
 	metadata, err := r.client.partitionMetadata(ctx, r.physicalTable)
 	if err != nil {
 		return nil, nil, err
@@ -1462,7 +2107,7 @@ func (r *regionRefresher) refresh(ctx context.Context) (*regionSnapshotBundle, [
 		return nil, nil, err
 	}
 	r.version++
-	bundle := &regionSnapshotBundle{id: newSnapshotID(), timestamp: now, mappingVersion: r.version, snapshots: snapshots, distribution: distribution, logicalTables: r.logicalTables, hotTargets: configHotTargets(definition, metadata, r.configTables)}
+	bundle := &regionSnapshotBundle{id: newSnapshotID(), timestamp: now, mappingVersion: r.version, snapshots: snapshots, distribution: distribution, logicalTables: r.logicalTables, hotTargets: configHotTargets(definition, metadata, r.configTables), datanodeCount: datanodeCount}
 	for _, snapshot := range snapshots {
 		prior, exists := r.previous[snapshot.regionID]
 		bundle.events = append(bundle.events, regionEvent(r.base, snapshot, exists, prior))
@@ -1601,6 +2246,18 @@ func (c httpSQLClient) regionSnapshots(ctx context.Context, physicalTable string
 		result = append(result, regionSnapshot{timestamp: now, partition: stringValue(row["partition_name"]), partitionExpression: stringValue(row["partition_expression"]), partitionDescription: stringValue(row["partition_description"]), regionID: regionID, leader: stringValue(row["peer_id"]), tableID: uintValue(row["table_id"]), regionNumber: uintValue(row["region_number"]), regionRows: uintValue(row["region_rows"]), writtenBytesSinceOpen: uintValue(row["written_bytes_since_open"]), queryCPUTimeMillis: uintValue(row["query_cpu_time_millis"]), queryScannedBytes: uintValue(row["query_scanned_bytes"]), diskSize: uintValue(row["disk_size"]), memtableSize: uintValue(row["memtable_size"]), manifestSize: uintValue(row["manifest_size"]), sstSize: uintValue(row["sst_size"]), sstNum: uintValue(row["sst_num"]), indexSize: uintValue(row["index_size"]), engine: stringValue(row["engine"]), role: stringValue(row["region_role"])})
 	}
 	return result, nil
+}
+
+func (c httpSQLClient) activeDatanodeCount(ctx context.Context) (uint64, error) {
+	rows, err := c.query(ctx, `SELECT peer_id FROM information_schema.cluster_info WHERE peer_type = 'DATANODE' AND active_time IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	seen := make(map[uint64]struct{}, len(rows))
+	for _, row := range rows {
+		seen[uintValue(row["peer_id"])] = struct{}{}
+	}
+	return uint64(len(seen)), nil
 }
 
 func (c httpSQLClient) partitionMetadata(ctx context.Context, physicalTable string) ([]sharedpartition.Metadata, error) {

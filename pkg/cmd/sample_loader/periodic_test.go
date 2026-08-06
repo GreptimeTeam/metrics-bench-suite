@@ -4,15 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	mathrand "math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	sharedpartition "metrics-bench-suite/pkg/partition"
+	"metrics-bench-suite/pkg/samples"
 
 	"github.com/prometheus/prometheus/prompb"
 )
@@ -46,6 +50,31 @@ func TestPeriodicOptionsRequireExplicitExpectation(t *testing.T) {
 	}
 	if options.TargetPhysicalTable != "metrics_physical" {
 		t.Fatalf("unexpected target physical table: %q", options.TargetPhysicalTable)
+	}
+}
+
+func TestPeriodicCaseSuppliesItsOwnExpectation(t *testing.T) {
+	cmd := NewCommand()
+	for name, value := range map[string]string{
+		"target-physical-table":       "metrics_physical",
+		"pressure-high-min-write-bps": "1",
+		"baseline-duration":           "0s",
+		"burst-active-duration":       "1s",
+		"transient-burst-duration":    "1s",
+		"burst-period":                "1s",
+		"observe-interval":            "1s",
+		"autopilot-case":              "migration",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	options, err := periodicOptionsFromCommand(cmd, &SampleLoader{DryRun: true, TickInterval: time.Second, Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.BurstClass != burstClassQualified || options.expectedAutopilotAction(burstClassQualified) != "rebalance" {
+		t.Fatalf("migration case must use a qualified rebalance plan: %#v", options)
 	}
 }
 
@@ -206,6 +235,39 @@ func TestEventWriterFlushesLifecycleEventImmediately(t *testing.T) {
 	}
 }
 
+func TestWorkloadWindowFlushesCurrentSnapshotWithoutReplayingRegionEvents(t *testing.T) {
+	var received []benchmarkEvent
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		decoder := json.NewDecoder(request.Body)
+		for {
+			var event benchmarkEvent
+			if err := decoder.Decode(&event); err != nil {
+				if err == io.EOF {
+					break
+				}
+				t.Fatal(err)
+			}
+			received = append(received, event)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	writer := newEventWriter(periodicOptions{MonitoringURL: server.URL + "/v1/ingest"})
+	snapshots := &regionSnapshotStore{}
+	snapshots.set(&regionSnapshotBundle{
+		id:        "snapshot-1",
+		timestamp: time.Unix(100, 0),
+		events:    []benchmarkEvent{{EventType: "region_stats_snapshot"}},
+	})
+	if err := emitWithCurrentSnapshotAndFlush(writer, context.Background(), benchmarkEvent{RunID: "run-1", EventType: "workload_window"}, snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if len(received) != 1 || received[0].EventType != "workload_window" || !strings.Contains(received[0].Details, `"snapshot_id":"snapshot-1"`) {
+		t.Fatalf("unexpected immediately flushed workload evidence: %#v", received)
+	}
+}
+
 func TestSeededBurstScheduleIsDeterministic(t *testing.T) {
 	first, firstSeed := newPeriodicRandom(42)
 	second, secondSeed := newPeriodicRandom(42)
@@ -270,7 +332,7 @@ func TestLegacyBurstPeriodStillUsesStartToStartScheduling(t *testing.T) {
 
 func TestPlannedBurstEventRecordsSeedAndSchedule(t *testing.T) {
 	scheduled := time.Unix(100, 0)
-	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256}, 42, burstClassQualified, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true, &regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}, {regionID: 3, leader: "node-a"}}})
+	event := plannedBurstEvent(benchmarkEvent{}, 2, scheduled, periodicOptions{BurstActiveDuration: time.Minute, TransientBurstDuration: time.Second, BurstPeriod: time.Hour, BurstJitter: 0.2, PressureHighMinWriteBPS: 1024, BaselineTargetWriteBPS: 256, AutopilotSchedule: defaultAutopilotSchedule()}, 42, "repartition", burstPlan{class: burstClassQualified, duration: time.Minute, targetWriteBPS: 1536, maximumWriteBPS: 3072, pressureScale: 1.0}, hotTarget{regionID: 7, labelName: "namespace", labelValue: "app-1"}, true, &regionSnapshotBundle{snapshots: []regionSnapshot{{regionID: 1, leader: "node-a"}, {regionID: 2, leader: "node-b"}, {regionID: 3, leader: "node-a"}}})
 	if event.EventType != "pressure_scheduled" || event.Phase != "baseline" || event.Cycle != 2 || event.ScheduledTSMS != scheduled.UnixMilli() {
 		t.Fatalf("unexpected planned event: %#v", event)
 	}
@@ -319,6 +381,55 @@ func TestEnqueuePeriodicRequestsPreservesTrafficLaneAndPacer(t *testing.T) {
 	}
 }
 
+func TestFocusedCaseProducesBaselineAndHotspotConcurrently(t *testing.T) {
+	var requests atomic.Uint64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		requests.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	lower, upper := 0.0, 1.0
+	fileConfigs := []samples.FileConfig{{
+		Name: "representative",
+		Config: samples.Config{
+			Tags: []samples.Tag{{
+				Name: "namespace",
+				Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{
+					{Value: "app-0", Weight: 1}, {Value: "app-1", Weight: 1},
+				}},
+			}},
+			Fields: []samples.Field{{Name: "value", Dist: samples.Distribution{Type: "uniform", LowerBound: &lower, UpperBound: &upper}}},
+		},
+	}}
+	snapshots := &regionSnapshotStore{}
+	snapshots.set(&regionSnapshotBundle{hotTargets: []hotTarget{
+		{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+		{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+	}})
+	loader := &SampleLoader{
+		RemoteWriteURL: server.URL,
+		Interval:       time.Millisecond,
+		MaxSamples:     10,
+		Workers:        2,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	current := time.Now()
+	err := loader.runPeriodicWrites(ctx, fileConfigs, &current, samples.NewChurnEpochGenerator(0), time.Now().Add(time.Second), time.Millisecond, "active", 1, periodicOptions{
+		TrafficMode:            "steady",
+		AutopilotCase:          "repartition",
+		BaselineTargetWriteBPS: 1 << 30,
+	}, nil, snapshots, benchmarkEvent{}, &hotTarget{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}}, burstPlan{class: burstClassQualified, targetWriteBPS: 1 << 30, maximumWriteBPS: 1 << 30})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("focused case error = %v, want context deadline", err)
+	}
+	if got := requests.Load(); got < 2 {
+		t.Fatalf("expected concurrent baseline and hotspot writes, got %d requests", got)
+	}
+}
+
 func TestBurstAmplifierAllowsSmallHotspotsToReachPressure(t *testing.T) {
 	amplifier := newBurstAmplifier(4)
 	for amplifier.value() < 256 {
@@ -328,6 +439,91 @@ func TestBurstAmplifierAllowsSmallHotspotsToReachPressure(t *testing.T) {
 	}
 	if amplifier.value() != 256 {
 		t.Fatalf("amplifier cap = %d, want 256", amplifier.value())
+	}
+}
+
+func TestExplicitCaseStartsWithEnoughValueConstrainedPasses(t *testing.T) {
+	if got := initialBurstAmplification(4, true); got != minCaseBurstPasses {
+		t.Fatalf("explicit case initial passes = %d, want %d", got, minCaseBurstPasses)
+	}
+	if got := initialBurstAmplification(128, true); got != 128 {
+		t.Fatalf("explicit case must preserve larger configured passes, got %d", got)
+	}
+	if got := initialBurstAmplification(4, false); got != 4 {
+		t.Fatalf("legacy path must preserve configured passes, got %d", got)
+	}
+}
+
+func TestExplicitQualifiedCaseReservesSourceDerivedStabilizationPlateau(t *testing.T) {
+	options := periodicOptions{
+		BurstActiveDuration: time.Minute,
+		AutopilotCase:       "repartition",
+		AutopilotSchedule: autopilotSchedule{
+			samplingWindow:     45 * time.Second,
+			maxHistoryWindows:  5,
+			repartitionSamples: 3,
+		},
+	}
+	plan := newBurstPlan(options, burstClassQualified, mathrand.New(mathrand.NewSource(1)))
+	if want := 6 * 45 * time.Second; plan.duration != want {
+		t.Fatalf("qualified case duration = %s, want %s", plan.duration, want)
+	}
+	if legacy := newBurstPlan(periodicOptions{BurstActiveDuration: time.Minute}, burstClassQualified, mathrand.New(mathrand.NewSource(1))); legacy.duration != time.Minute {
+		t.Fatalf("legacy qualified duration = %s, want configured value", legacy.duration)
+	}
+}
+
+func TestExplicitCaseRetainsSmallStableBaseline(t *testing.T) {
+	options := periodicOptions{BaselineTargetWriteBPS: 2 * 1024 * 1024}
+	plan := burstPlan{targetWriteBPS: 12 * 1024 * 1024}
+	if got, want := activeBaselineTarget(options, plan, true), min(options.BaselineTargetWriteBPS, plan.targetWriteBPS*caseBaselineRatio); got != want {
+		t.Fatalf("focused baseline = %f, want %f", got, want)
+	}
+	if got := activeBaselineTarget(options, plan, false); got != options.BaselineTargetWriteBPS {
+		t.Fatalf("legacy baseline = %f, want %f", got, options.BaselineTargetWriteBPS)
+	}
+}
+
+func TestExplicitCaseStopsAdaptingAfterPressureFloor(t *testing.T) {
+	if got := pressureAdjustmentFloor(100, 200, true); math.Abs(got-110) > 1e-9 {
+		t.Fatalf("explicit case adjustment floor = %f, want 110", got)
+	}
+	if got := pressureAdjustmentFloor(100, 80, true); got != 80 {
+		t.Fatalf("explicit case must not exceed its configured target, got %f", got)
+	}
+	if got := pressureAdjustmentFloor(100, 200, false); got != 200 {
+		t.Fatalf("legacy adjustment floor = %f, want configured target", got)
+	}
+}
+
+func TestTransientPlanIsRandomButBelowSchedulerHistoryAndPressureThreshold(t *testing.T) {
+	options := periodicOptions{
+		BaselineTickInterval:    15 * time.Second,
+		TransientBurstDuration:  5 * time.Minute,
+		PressureHighMinWriteBPS: 8 * 1024 * 1024,
+		AutopilotSchedule:       defaultAutopilotSchedule(),
+	}
+	random := mathrand.New(mathrand.NewSource(42))
+	plan := newBurstPlan(options, burstClassTransient, random)
+	if plan.duration < options.BaselineTickInterval || plan.duration >= 2*options.AutopilotSchedule.samplingWindow {
+		t.Fatalf("transient duration %s must remain below the %s history horizon", plan.duration, 2*options.AutopilotSchedule.samplingWindow)
+	}
+	if plan.targetWriteBPS <= 0 || plan.targetWriteBPS >= options.PressureHighMinWriteBPS {
+		t.Fatalf("transient target %f must remain below high threshold %f", plan.targetWriteBPS, options.PressureHighMinWriteBPS)
+	}
+	if plan.pressureScale < minTransientScale || plan.pressureScale > maxTransientScale {
+		t.Fatalf("transient scale %f outside [%f,%f]", plan.pressureScale, minTransientScale, maxTransientScale)
+	}
+}
+
+func TestMigrationCaseBootstrapsRepartitionUntilTopologyHasRegionSurplus(t *testing.T) {
+	withoutSurplus := &regionSnapshotBundle{datanodeCount: 3, snapshots: []regionSnapshot{{regionID: 1}, {regionID: 2}, {regionID: 3}}}
+	if got := effectiveAutopilotCase("migration", withoutSurplus); got != "repartition" {
+		t.Fatalf("migration case without surplus = %q, want repartition bootstrap", got)
+	}
+	withSurplus := &regionSnapshotBundle{datanodeCount: 3, snapshots: []regionSnapshot{{regionID: 1}, {regionID: 2}, {regionID: 3}, {regionID: 4}}}
+	if got := effectiveAutopilotCase("migration", withSurplus); got != "migration" {
+		t.Fatalf("migration case with surplus = %q, want migration", got)
 	}
 }
 
@@ -345,6 +541,105 @@ func TestConfigHotTargetsUseConfiguredPartitionValues(t *testing.T) {
 	}
 	if !matchesHotTarget(prompb.TimeSeries{Labels: []prompb.Label{{Name: "namespace", Value: "app-1"}}}, targets[1]) {
 		t.Fatal("expected matching target label")
+	}
+}
+
+func TestConfigHotTargetsGroupsMultipleValuesInOneRegion(t *testing.T) {
+	definition, err := sharedpartition.ParsePartitionDefinition("PARTITION ON COLUMNS (namespace) (namespace < 'app-3', namespace >= 'app-3')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := configHotTargets(definition, []sharedpartition.Metadata{
+		{Name: "p0", Ordinal: 1, Expression: "namespace", Description: "namespace < 'app-3'", RegionID: 42},
+		{Name: "p1", Ordinal: 2, Expression: "namespace", Description: "namespace >= 'app-3'", RegionID: 43},
+	}, []sharedpartition.ConfigTable{{LabelValues: map[string][]string{"namespace": {"app-0", "app-1", "app-2", "app-3"}}}})
+	if len(targets) != 2 || len(targets[0].values()) != 3 || targets[0].labelValue != "app-0" {
+		t.Fatalf("unexpected grouped hot targets: %#v", targets)
+	}
+	if _, ok := selectHotTarget(&regionSnapshotBundle{hotTargets: targets}, mathrand.New(mathrand.NewSource(1)), "repartition"); !ok {
+		t.Fatal("expected a multi-value repartition target")
+	}
+}
+
+func TestMigrationTargetUsesColocatedRegions(t *testing.T) {
+	bundle := &regionSnapshotBundle{
+		hotTargets: []hotTarget{
+			{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+			{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+			{regionID: 3, labelName: "namespace", labelValues: []string{"app-2"}},
+		},
+		snapshots: []regionSnapshot{
+			{regionID: 1, leader: "dn-1"},
+			{regionID: 2, leader: "dn-1"},
+			{regionID: 3, leader: "dn-2"},
+		},
+	}
+	target, ok := selectHotTarget(bundle, mathrand.New(mathrand.NewSource(1)), "migration")
+	if !ok {
+		t.Fatal("expected a colocated migration target")
+	}
+	if got := hotTargetRegionIDs(target); !reflect.DeepEqual(got, []uint64{1, 2}) {
+		t.Fatalf("migration target regions = %v, want colocated regions [1 2]", got)
+	}
+}
+
+func TestMigrationTargetRequiresColocation(t *testing.T) {
+	bundle := &regionSnapshotBundle{
+		hotTargets: []hotTarget{
+			{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+			{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+		},
+		snapshots: []regionSnapshot{{regionID: 1, leader: "dn-1"}, {regionID: 2, leader: "dn-2"}},
+	}
+	if _, ok := selectHotTarget(bundle, mathrand.New(mathrand.NewSource(1)), "migration"); ok {
+		t.Fatal("migration must not pretend a one-region-per-node topology can rebalance")
+	}
+}
+
+func TestBalancedMigrationTargetsPreferComparableConfiguredVolume(t *testing.T) {
+	group := []hotTarget{{regionID: 1}, {regionID: 2}, {regionID: 3}}
+	got := balancedMigrationTargets(group, []sharedpartition.RegionDistribution{
+		{RegionID: 1, SeriesCount: 10},
+		{RegionID: 2, SeriesCount: 1_000},
+		{RegionID: 3, SeriesCount: 900},
+	})
+	if ids := hotTargetRegionIDs(hotTarget{members: got}); !reflect.DeepEqual(ids, []uint64{2, 3}) {
+		t.Fatalf("balanced migration regions = %v, want [2 3]", ids)
+	}
+}
+
+func TestCaseBackgroundPlanUsesConfigDerivedValueForEachRegion(t *testing.T) {
+	fileConfigs := []samples.FileConfig{{
+		Name: "representative",
+		Config: samples.Config{Tags: []samples.Tag{{
+			Name: "namespace",
+			Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{
+				{Value: "app-0", Weight: 1},
+				{Value: "app-1", Weight: 1},
+			}},
+		}}},
+	}}
+	bundle := &regionSnapshotBundle{hotTargets: []hotTarget{
+		{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}},
+		{regionID: 2, labelName: "namespace", labelValues: []string{"app-1"}},
+	}}
+	backgrounds := caseBackgroundPlan(fileConfigs, bundle)
+	if len(backgrounds) != 2 || backgrounds[0].fileConfig.Name != "representative" || backgrounds[1].target.regionID != 2 {
+		t.Fatalf("unexpected case background plan: %#v", backgrounds)
+	}
+}
+
+func TestCaseBackgroundPlanPrefersLargerConfigForStableSampling(t *testing.T) {
+	fileConfigs := []samples.FileConfig{
+		{Name: "small", SeriesCount: 1, FieldGenerators: map[string]samples.FloatGenerator{}, Config: samples.Config{Tags: []samples.Tag{{Name: "namespace", Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{{Value: "app-0", Weight: 1}}}}}}},
+		{Name: "large", SeriesCount: 100, FieldGenerators: map[string]samples.FloatGenerator{}, Config: samples.Config{Tags: []samples.Tag{{Name: "namespace", Dist: samples.Distribution{Type: "weighted_preset", Preset: []samples.PresetItem{{Value: "app-0", Weight: 1}}}}}}},
+	}
+	backgrounds := caseBackgroundPlan(fileConfigs, &regionSnapshotBundle{hotTargets: []hotTarget{{regionID: 1, labelName: "namespace", labelValues: []string{"app-0"}}}})
+	if len(backgrounds) != 1 || backgrounds[0].fileConfig.Name != "large" {
+		t.Fatalf("expected largest representative config, got %#v", backgrounds)
+	}
+	if backgrounds[0].fileConfig.FieldGenerators != nil {
+		t.Fatal("background config must not share mutable field-generator cache")
 	}
 }
 
