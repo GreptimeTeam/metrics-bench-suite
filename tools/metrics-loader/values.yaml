@@ -1,0 +1,52 @@
+replicaCount: 1
+
+image:
+  repository: greptime-registry.cn-hangzhou.cr.aliyuncs.com/tools/metrics-bench-suite
+  tag: "0.3.2"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+job:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: null
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+sampleLoader:
+  # Path inside the image. Built-in sample configurations are under /configs.
+  config: "/configs/debug_samples"
+  # Required unless dryRun is true. This can be a Prometheus remote write or
+  # OTLP HTTP/protobuf endpoint, depending on protocol.
+  remoteWriteUrl: ""
+  startDate: "2025-01-01T00:00:00Z"
+  endDate: "2025-01-01T00:01:00Z"
+  interval: "30s"
+  maxSamples: 20000
+  tickInterval: "30s"
+  workers: 1
+  # Use the Indexed Job completion index as --replica. Set this to false to
+  # use the fixed replica value instead.
+  replicaFromJobCompletionIndex: true
+  replica: 0
+  infinite: true
+  tablePickCount: "18446744073709551615"
+  dryRun: false
+  churnRate: 0
+  churnInterval: "0s"
+  protocol: prometheus

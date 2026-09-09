@@ -1,0 +1,110 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "metrics-loader.jobName" . }}
+  labels:
+    {{- include "metrics-loader.labels" . | nindent 4 }}
+  {{- with .Values.job.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  completions: {{ .Values.replicaCount }}
+  parallelism: {{ .Values.replicaCount }}
+  completionMode: Indexed
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  {{- if ne .Values.job.ttlSecondsAfterFinished nil }}
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "metrics-loader.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "metrics-loader.serviceAccountName" . }}
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: sample-loader
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sample_loader"]
+          args:
+            - --config
+            - {{ required "sampleLoader.config is required" .Values.sampleLoader.config | quote }}
+            {{- if .Values.sampleLoader.remoteWriteUrl }}
+            - --remote-write-url
+            - {{ .Values.sampleLoader.remoteWriteUrl | quote }}
+            {{- else if not .Values.sampleLoader.dryRun }}
+            {{- fail "sampleLoader.remoteWriteUrl is required unless sampleLoader.dryRun is true" }}
+            {{- end }}
+            - --start-date
+            - {{ .Values.sampleLoader.startDate | quote }}
+            - --end-date
+            - {{ .Values.sampleLoader.endDate | quote }}
+            - --interval
+            - {{ .Values.sampleLoader.interval | quote }}
+            - --max-samples
+            - {{ .Values.sampleLoader.maxSamples | quote }}
+            - --tick-interval
+            - {{ .Values.sampleLoader.tickInterval | quote }}
+            - --workers
+            - {{ .Values.sampleLoader.workers | quote }}
+            - --replica
+            {{- if .Values.sampleLoader.replicaFromJobCompletionIndex }}
+            - $(REPLICA_INDEX)
+            {{- else }}
+            - {{ .Values.sampleLoader.replica | quote }}
+            {{- end }}
+            {{- if .Values.sampleLoader.infinite }}
+            - --infinite
+            {{- end }}
+            - --table-pick-count
+            {{- if and (eq (len .Values.sampleLoader.tablePickCount) 20) (gt .Values.sampleLoader.tablePickCount "18446744073709551615") }}
+            {{- fail "sampleLoader.tablePickCount must not exceed 18446744073709551615" }}
+            {{- end }}
+            - {{ .Values.sampleLoader.tablePickCount | quote }}
+            {{- if .Values.sampleLoader.dryRun }}
+            - --dry-run
+            {{- end }}
+            - --churn-rate
+            - {{ .Values.sampleLoader.churnRate | quote }}
+            - --churn-interval
+            - {{ .Values.sampleLoader.churnInterval | quote }}
+            - --protocol
+            - {{ .Values.sampleLoader.protocol | quote }}
+          {{- if .Values.sampleLoader.replicaFromJobCompletionIndex }}
+          env:
+            - name: REPLICA_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
