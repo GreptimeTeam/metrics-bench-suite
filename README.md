@@ -6,4 +6,6 @@ Metrics Bench Suite is a set of tools designed to benchmark the storage and quer
 
 - `timeseries_analyzer`: Analyze number of timeseries in tcpdump output.
 - `remote_write_request_viewer`: View remote write requests details.
-- `loader`: Load time series data into the target database.
+- `loader`: Load time series data into the target database using Prometheus remote write or OTLP Metrics over HTTP/protobuf.
+
+The writing tools accept `--protocol prometheus` (the default) or `--protocol otlp`. Generated scalar time series are encoded as OTLP Gauge metrics; `__name__` becomes the metric name, other labels become string attributes, and timestamps are converted from milliseconds to nanoseconds.

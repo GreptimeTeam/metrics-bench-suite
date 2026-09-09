@@ -3,6 +3,7 @@ package sampleloader
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -131,25 +132,7 @@ func logRunStats(statsByWorker []runStats, elapsed time.Duration, dryRun bool) {
 	log.Print(b.String())
 }
 
-func waitForWorkers(wg *sync.WaitGroup, cancel context.CancelFunc, timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-	case <-timer.C:
-		log.Printf("Drain timeout reached, canceling unfinished requests")
-		cancel()
-		<-done
-	}
-}
-
-// SampleLoader generates samples from config files and sends them to a remote-write endpoint.
+// SampleLoader generates samples and sends them using Prometheus remote write or OTLP Metrics.
 type SampleLoader struct {
 	ConfigPath     string
 	RemoteWriteURL string
@@ -166,7 +149,8 @@ type SampleLoader struct {
 	Replica        int
 	Username       string
 	Password       string
-	// ChurnRate is the fraction (0.0–1.0) of time series that will be churned at each churn event.
+	Protocol       string
+	// ChurnRate is the fraction (0.0-1.0) of time series churned at each churn event.
 	ChurnRate float64
 	// ChurnInterval is the duration between churn events.
 	ChurnInterval time.Duration
@@ -178,36 +162,34 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	initialDateStr, _ := cmd.Flags().GetString("start-date")
 	endDateStr, _ := cmd.Flags().GetString("end-date")
 	tickIntervalStr, _ := cmd.Flags().GetString("tick-interval")
-	s.Interval, err = time.ParseDuration(intervalStr)
-	if err != nil {
+	if s.Interval, err = time.ParseDuration(intervalStr); err != nil {
 		return err
 	}
-	s.ConfigPath, err = cmd.Flags().GetString("config")
-	if err != nil {
+	if s.ConfigPath, err = cmd.Flags().GetString("config"); err != nil {
 		return err
 	}
-	s.StartDate, err = time.Parse(time.RFC3339, initialDateStr)
-	if err != nil {
+	if s.StartDate, err = time.Parse(time.RFC3339, initialDateStr); err != nil {
 		return err
 	}
-	s.EndDate, err = time.Parse(time.RFC3339, endDateStr)
-	if err != nil {
+	if s.EndDate, err = time.Parse(time.RFC3339, endDateStr); err != nil {
 		return err
 	}
-	s.DryRun, err = cmd.Flags().GetBool("dry-run")
-	if err != nil {
+	if s.DryRun, err = cmd.Flags().GetBool("dry-run"); err != nil {
 		return err
 	}
-
-	// Check for remote-write-url early, only required when not in dry-run mode
-	s.RemoteWriteURL, err = cmd.Flags().GetString("remote-write-url")
-	if err != nil {
+	if s.RemoteWriteURL, err = cmd.Flags().GetString("remote-write-url"); err != nil {
 		return err
 	}
-
-	// Check if remote-write-url is required (not in dry-run mode)
 	if !s.DryRun && s.RemoteWriteURL == "" {
 		return fmt.Errorf("remote-write-url is required when not in dry-run mode")
+	}
+	if s.Protocol, err = cmd.Flags().GetString("protocol"); err != nil {
+		return err
+	}
+	s.Protocol = strings.ToLower(strings.TrimSpace(s.Protocol))
+	requester, err := http.NewRequesterForProtocol(s.RemoteWriteURL, s.Protocol)
+	if err != nil {
+		return err
 	}
 	remoteWriteVersionValue, err := cmd.Flags().GetString("remote-write-version")
 	if err != nil {
@@ -217,20 +199,19 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	s.MaxSamples, err = cmd.Flags().GetInt("max-samples")
-	if err != nil {
+	if s.Protocol == http.ProtocolOTLP && version != remoteWriteV1 {
+		return fmt.Errorf("remote-write-version applies only to the prometheus protocol")
+	}
+	if s.MaxSamples, err = cmd.Flags().GetInt("max-samples"); err != nil {
 		return err
 	}
-	s.TickInterval, err = time.ParseDuration(tickIntervalStr)
-	if err != nil {
+	if s.TickInterval, err = time.ParseDuration(tickIntervalStr); err != nil {
 		return err
 	}
-	s.Workers, err = cmd.Flags().GetInt("workers")
-	if err != nil {
+	if s.Workers, err = cmd.Flags().GetInt("workers"); err != nil {
 		return err
 	}
-	s.Infinite, err = cmd.Flags().GetBool("infinite")
-	if err != nil {
+	if s.Infinite, err = cmd.Flags().GetBool("infinite"); err != nil {
 		return err
 	}
 	duration, err := cmd.Flags().GetDuration("duration")
@@ -243,44 +224,41 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if s.Infinite && duration > 0 {
 		return fmt.Errorf("duration and infinite cannot be used together")
 	}
-	s.TablePickCount, err = cmd.Flags().GetUint64("table-pick-count")
-	if err != nil {
+	if s.TablePickCount, err = cmd.Flags().GetUint64("table-pick-count"); err != nil {
 		return err
 	}
-	s.Replica, err = cmd.Flags().GetInt("replica")
-	if err != nil {
+	if s.Replica, err = cmd.Flags().GetInt("replica"); err != nil {
 		return err
 	}
-	s.Username, err = cmd.Flags().GetString("username")
-	if err != nil {
+	if s.Username, err = cmd.Flags().GetString("username"); err != nil {
 		return err
 	}
-	s.Password, err = cmd.Flags().GetString("password")
-	if err != nil {
+	if s.Password, err = cmd.Flags().GetString("password"); err != nil {
 		return err
 	}
 	if (s.Username == "") != (s.Password == "") {
 		return fmt.Errorf("username and password must be provided together")
 	}
-
-	s.ChurnRate, err = cmd.Flags().GetFloat64("churn-rate")
-	if err != nil {
+	if authorization := s.authorizationHeader(); authorization != "" {
+		requester.SetHeader("Authorization", authorization)
+	}
+	if s.ChurnRate, err = cmd.Flags().GetFloat64("churn-rate"); err != nil {
 		return err
 	}
-	if s.ChurnRate < 0.0 || s.ChurnRate > 1.0 {
+	if s.ChurnRate < 0 || s.ChurnRate > 1 {
 		return fmt.Errorf("churn-rate must be between 0.0 and 1.0")
 	}
-
 	churnIntervalStr, _ := cmd.Flags().GetString("churn-interval")
-	s.ChurnInterval, err = time.ParseDuration(churnIntervalStr)
-	if err != nil {
+	if s.ChurnInterval, err = time.ParseDuration(churnIntervalStr); err != nil {
 		return err
 	}
+
 	log.Printf("Start date: %s", s.StartDate)
 	log.Printf("End date: %s", s.EndDate)
 	log.Printf("Interval: %s", s.Interval)
 	log.Printf("Tick interval: %s", s.TickInterval)
 	log.Printf("Config path: %s", s.ConfigPath)
+	log.Printf("Protocol: %s", s.Protocol)
 	log.Printf("Remote write version: %s", remoteWriteVersionValue)
 	log.Printf("Table pick rate: %d", s.TablePickCount)
 	log.Printf("Replica label value: %d", s.Replica)
@@ -297,36 +275,14 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	if len(fileConfigs) == 0 {
 		return fmt.Errorf("no config files found")
 	}
-
 	samples.AssignChurnIndices(fileConfigs, s.ChurnRate)
-
 	log.Printf("Generating metrics...")
-
-	requestChan := make(chan prompb.WriteRequest, s.Workers)
-
-	var statsByWorker []runStats
-	if duration > 0 {
-		statsByWorker = make([]runStats, s.Workers)
-	}
-	requestCtx, cancelRequests := context.WithCancel(context.Background())
-	defer cancelRequests()
-	wg := sync.WaitGroup{}
-	for i := 0; i < s.Workers; i++ {
-		var stats *runStats
-		if statsByWorker != nil {
-			stats = &statsByWorker[i]
-		}
-		wg.Add(1)
-		go worker(requestCtx, i, s.RemoteWriteURL, s.authorizationHeader(), version, requestChan, &wg, s.DryRun, stats)
-	}
 
 	current := s.StartDate
 	live := s.Infinite || duration > 0
 	if live {
 		current = time.Now()
 	}
-
-	// Apply a one-time startup jitter in [0, tick_interval)
 	var jitter time.Duration
 	if s.TickInterval > 0 {
 		jitter = time.Duration(rand.Float64() * float64(s.TickInterval))
@@ -337,41 +293,71 @@ func (s *SampleLoader) run(cmd *cobra.Command, _ []string) error {
 	}
 
 	generationCtx := context.Background()
-	var durationStart time.Time
+	durationStart := time.Now()
 	if duration > 0 {
-		durationStart = time.Now()
 		var cancel context.CancelFunc
 		generationCtx, cancel = context.WithTimeout(generationCtx, duration)
 		defer cancel()
 	}
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+
+	churnEpochGenerator := samples.NewChurnEpochGenerator(s.ChurnInterval)
+	currentEpoch := churnEpochGenerator.GetChurnEpoch()
+	stats := newWriteStats(durationStart)
+	if s.ChurnRate > 0 && s.ChurnInterval > 0 {
+		stats.enableChurn(currentEpoch)
+	}
+	if s.DryRun {
+		stats.enableEmptyFinalReport()
+	}
+	stopStatsReporter := startStatsReporter(stats)
+	defer stopStatsReporter()
+
+	requestChan := make(chan prompb.WriteRequest, s.Workers)
+	workerErrors := make(chan error, s.Workers)
+	var statsByWorker []runStats
+	if duration > 0 {
+		statsByWorker = make([]runStats, s.Workers)
+	}
+	for i := 0; i < s.Workers; i++ {
+		worker := sampleWorker{
+			id:        i,
+			ctx:       requestCtx,
+			requester: requester,
+			protocol:  s.Protocol,
+			version:   version,
+			stats:     stats,
+			dryRun:    s.DryRun,
+		}
+		if statsByWorker != nil {
+			worker.runStats = &statsByWorker[i]
+		}
+		go func() { workerErrors <- worker.run(requestChan) }()
+	}
 
 	finish := func() error {
 		close(requestChan)
+		timeout := time.Duration(0)
 		if duration > 0 {
-			waitForWorkers(&wg, cancelRequests, drainGracePeriod)
-			logRunStats(statsByWorker, time.Since(durationStart), s.DryRun)
-		} else {
-			wg.Wait()
+			timeout = drainGracePeriod
 		}
-		return nil
+		err := waitForWorkers(workerErrors, s.Workers, cancelRequests, timeout)
+		if duration > 0 {
+			logRunStats(statsByWorker, time.Since(durationStart), s.DryRun)
+		}
+		return err
 	}
 
-	// Track start time for churn epoch calculation
-	churnEpochGenerator := samples.NewChurnEpochGenerator(s.ChurnInterval)
-	currentEpoch := churnEpochGenerator.GetChurnEpoch()
-
-	// First generation immediately after jitter
 	log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
 	if !s.convertToRemoteWriteRequestsStreaming(generationCtx, fileConfigs, current, requestChan, currentEpoch) {
 		log.Printf("Duration reached, stopping")
 		return finish()
 	}
 	current = current.Add(s.Interval)
-	if !live {
-		if current.After(s.EndDate) {
-			log.Printf("End date reached, stopping")
-			return finish()
-		}
+	if !live && current.After(s.EndDate) {
+		log.Printf("End date reached, stopping")
+		return finish()
 	}
 
 	ticker := time.NewTicker(s.TickInterval)
@@ -384,6 +370,7 @@ runLoop:
 			newEpoch := churnEpochGenerator.GetChurnEpoch()
 			if newEpoch != currentEpoch {
 				currentEpoch = newEpoch
+				stats.setChurnEpoch(currentEpoch)
 			}
 			log.Printf("Generating samples for %s (churn epoch: %d)", current, currentEpoch)
 			if !s.convertToRemoteWriteRequestsStreaming(generationCtx, fileConfigs, current, requestChan, currentEpoch) {
@@ -412,52 +399,95 @@ func (s *SampleLoader) authorizationHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(authInfo))
 }
 
-func worker(ctx context.Context, id int, url string, authorizationHeader string, version remoteWriteVersion, request <-chan prompb.WriteRequest, wg *sync.WaitGroup, dryRun bool, stats *runStats) {
-	defer wg.Done()
-	for request := range request {
+type sampleWorker struct {
+	id        int
+	ctx       context.Context
+	requester *http.Requester
+	protocol  string
+	version   remoteWriteVersion
+	stats     *writeStats
+	runStats  *runStats
+	dryRun    bool
+}
+
+func (w sampleWorker) run(requests <-chan prompb.WriteRequest) error {
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var sendErr error
+	for request := range requests {
 		if ctx.Err() != nil {
-			return
+			return errors.Join(sendErr, ctx.Err())
 		}
-		numSeries := len(request.Timeseries)
-		numSamples := uint64(0)
-		for i := range request.Timeseries {
-			numSamples += uint64(len(request.Timeseries[i].Samples))
+		rows := rowsInRequest(request)
+		if w.dryRun {
+			w.runStats.record(rows, false, 0)
+			continue
 		}
-		failed := false
-		var requestTime time.Duration
-		if dryRun {
-			log.Printf("worker %d (dry-run) would send request with num series: %d", id, numSeries)
-		} else {
-			now := time.Now()
-			r := http.NewRequester(url)
-			if authorizationHeader != "" {
-				r.SetHeader("Authorization", authorizationHeader)
-			}
-			var err error
-			switch version {
-			case remoteWriteV1:
-				err = r.SendContext(ctx, request)
-			case remoteWriteV2:
-				err = r.SendV2Context(ctx, convertToRemoteWriteV2Request(request))
-			default:
-				err = fmt.Errorf("unsupported remote write version: %d", version)
-			}
-			requestTime = time.Since(now)
-			if err != nil {
-				log.Printf("worker %d failed to send write request: %v", id, err)
-				failed = true
-			} else {
-				log.Printf("worker %d sent request in %s, num series: %d", id, requestTime, numSeries)
-			}
+
+		startedAt := time.Now()
+		err := w.send(ctx, request)
+		latency := time.Since(startedAt)
+		w.runStats.record(rows, err != nil, latency)
+		if err == nil {
+			w.stats.record(rows, latency)
+			continue
 		}
-		stats.record(numSamples, failed, requestTime)
+
+		var partialSuccess *http.PartialSuccessError
+		if errors.As(err, &partialSuccess) {
+			rejected := min(rows, partialSuccess.RejectedDataPoints)
+			w.stats.record(rows-rejected, latency)
+		}
+		log.Printf("worker %d failed to send write request: %v", w.id, err)
+		sendErr = errors.Join(sendErr, err)
+	}
+	return sendErr
+}
+
+func (w sampleWorker) send(ctx context.Context, request prompb.WriteRequest) error {
+	if w.protocol == http.ProtocolOTLP || w.version == remoteWriteV1 {
+		return w.requester.SendContext(ctx, request)
+	}
+	return w.requester.SendV2Context(ctx, convertToRemoteWriteV2Request(request))
+}
+
+func rowsInRequest(request prompb.WriteRequest) uint64 {
+	var rows uint64
+	for _, series := range request.Timeseries {
+		rows += uint64(len(series.Samples))
+	}
+	return rows
+}
+
+func waitForWorkers(workerErrors <-chan error, workers int, cancel context.CancelFunc, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		var sendErr error
+		for range workers {
+			sendErr = errors.Join(sendErr, <-workerErrors)
+		}
+		done <- sendErr
+	}()
+	if timeout <= 0 {
+		return <-done
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		log.Printf("Drain timeout reached, canceling unfinished requests")
+		cancel()
+		return <-done
 	}
 }
 
 func convertToRemoteWriteV2Request(request prompb.WriteRequest) writev2.Request {
 	symbols := writev2.NewSymbolTable()
 	timeSeries := make([]writev2.TimeSeries, len(request.Timeseries))
-
 	for i := range request.Timeseries {
 		source := &request.Timeseries[i]
 		labelRefs := make([]uint32, 0, 2*len(source.Labels))
@@ -465,30 +495,18 @@ func convertToRemoteWriteV2Request(request prompb.WriteRequest) writev2.Request 
 			labelRefs = append(labelRefs, symbols.Symbolize(source.Labels[j].Name))
 			labelRefs = append(labelRefs, symbols.Symbolize(source.Labels[j].Value))
 		}
-
-		samples := make([]writev2.Sample, len(source.Samples))
+		convertedSamples := make([]writev2.Sample, len(source.Samples))
 		for j := range source.Samples {
-			samples[j] = writev2.Sample{
-				Value:     source.Samples[j].Value,
-				Timestamp: source.Samples[j].Timestamp,
-			}
+			convertedSamples[j] = writev2.Sample{Value: source.Samples[j].Value, Timestamp: source.Samples[j].Timestamp}
 		}
-
-		timeSeries[i] = writev2.TimeSeries{
-			LabelsRefs: labelRefs,
-			Samples:    samples,
-		}
+		timeSeries[i] = writev2.TimeSeries{LabelsRefs: labelRefs, Samples: convertedSamples}
 	}
-
-	return writev2.Request{
-		Symbols:    symbols.Symbols(),
-		Timeseries: timeSeries,
-	}
+	return writev2.Request{Symbols: symbols.Symbols(), Timeseries: timeSeries}
 }
 
-// generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine
+// generateTimeSeriesForFileConfig generates time series for a single file config using a dedicated goroutine.
 func (s *SampleLoader) generateTimeSeriesForFileConfig(ctx context.Context, fileConfig *samples.FileConfig, currentTime time.Time, churnEpoch int64) <-chan prompb.TimeSeries {
-	timeSeriesChan := make(chan prompb.TimeSeries, 1) // Buffered to allow the goroutine to start
+	timeSeriesChan := make(chan prompb.TimeSeries, 1)
 	go func() {
 		defer close(timeSeriesChan)
 		fileConfig.GeneratePermutedTimeSeriesContext(ctx, currentTime, churnEpoch, s.Replica, timeSeriesChan)
@@ -497,19 +515,13 @@ func (s *SampleLoader) generateTimeSeriesForFileConfig(ctx context.Context, file
 }
 
 func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context, fileConfigs []samples.FileConfig, currentTime time.Time, requestChan chan<- prompb.WriteRequest, churnEpoch int64) bool {
-	// Create a combined channel that merges all time series from all file configs
 	timeSeriesChan := make(chan prompb.TimeSeries, len(fileConfigs))
-
 	var wg sync.WaitGroup
-	// Start a goroutine for each file config
 	for i := range fileConfigs {
 		wg.Add(1)
 		go func(fc *samples.FileConfig) {
 			defer wg.Done()
-			// Get the time series channel for this file config
-			tsChan := s.generateTimeSeriesForFileConfig(ctx, fc, currentTime, churnEpoch)
-			// Forward all time series to the main channel
-			for ts := range tsChan {
+			for ts := range s.generateTimeSeriesForFileConfig(ctx, fc, currentTime, churnEpoch) {
 				select {
 				case timeSeriesChan <- ts:
 				case <-ctx.Done():
@@ -518,8 +530,6 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context
 			}
 		}(&fileConfigs[i])
 	}
-
-	// Close the main channel when all goroutines are done
 	go func() {
 		wg.Wait()
 		close(timeSeriesChan)
@@ -533,8 +543,6 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context
 			return false
 		}
 	}
-
-	// Collect time series and send in batches
 	tsSet := make([]prompb.TimeSeries, 0, s.MaxSamples)
 	for ts := range timeSeriesChan {
 		if ctx.Err() != nil {
@@ -542,21 +550,17 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context
 		}
 		tsSet = append(tsSet, ts)
 		if len(tsSet) >= s.MaxSamples {
-			// Send a batch when we reach maxSamples
 			if !enqueue(tsSet) {
 				for range timeSeriesChan {
 				}
 				return false
 			}
-			tsSet = make([]prompb.TimeSeries, 0, s.MaxSamples) // Reset the slice
+			tsSet = make([]prompb.TimeSeries, 0, s.MaxSamples)
 		}
 	}
-
 	if ctx.Err() != nil {
 		return false
 	}
-
-	// Send any remaining time series
 	if len(tsSet) > 0 {
 		return enqueue(tsSet)
 	}
@@ -566,8 +570,7 @@ func (s *SampleLoader) convertToRemoteWriteRequestsStreaming(ctx context.Context
 // NewCommand creates the sample loader command.
 func NewCommand() *cobra.Command {
 	sampleLoader := &SampleLoader{}
-
-	var rootCmd = &cobra.Command{
+	rootCmd := &cobra.Command{
 		Use:   "sample_loader",
 		Short: "SampleLoader is a tool to load samples from a file",
 		Run: func(cmd *cobra.Command, args []string) {
@@ -578,8 +581,8 @@ func NewCommand() *cobra.Command {
 	}
 
 	rootCmd.Flags().StringP("config", "c", "", "The path to the config file")
-	rootCmd.Flags().StringP("remote-write-url", "u", "", "The remote write url")
-	rootCmd.Flags().String("remote-write-version", "v1", "The remote write protocol version (v1 or v2)")
+	rootCmd.Flags().StringP("remote-write-url", "u", "", "The metrics write endpoint URL")
+	rootCmd.Flags().String("remote-write-version", "v1", "The Prometheus remote write protocol version (v1 or v2)")
 	rootCmd.Flags().StringP("start-date", "", "2025-01-01T00:00:00Z", "The start date of the data")
 	rootCmd.Flags().StringP("end-date", "", "2025-01-01T00:01:00Z", "The end date of the data")
 	rootCmd.Flags().StringP("interval", "", "30s", "The interval of the data")
@@ -595,6 +598,6 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().Bool("dry-run", false, "Run in dry-run mode without sending requests")
 	rootCmd.Flags().Float64("churn-rate", 0.0, "The rate of time series to churn (0.0-1.0, e.g., 0.01 = 1%)")
 	rootCmd.Flags().String("churn-interval", "0s", "The interval at which churn occurs (e.g., 10m)")
-
+	rootCmd.Flags().String("protocol", http.ProtocolPrometheus, "Metrics write protocol (prometheus or otlp)")
 	return rootCmd
 }

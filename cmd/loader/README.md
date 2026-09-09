@@ -4,7 +4,7 @@ The Metrics Bench Suite Loader is designed to load time series data, where the t
 
 ## Features
 
-- Load data into a database using Prometheus write requests.
+- Load data into a database using Prometheus remote write or OTLP Metrics over HTTP/protobuf.
 - Supports dry-run mode for testing without actual data processing.
 - Configurable time series per request and interval.
 - Uses a random seed for generating data.
@@ -19,6 +19,7 @@ The Metrics Bench Suite Loader is designed to load time series data, where the t
 - `-s, --seed`: The seed for the random number generator (default: `123456`).
 - `--start-date`: The start date of the data (default: `2025-01-01T00:00:00Z`).
 - `-d, --dry-run`: Dry run the loader without processing data.
+- `--protocol`: Metrics write protocol, `prometheus` or `otlp` (default: `prometheus`).
 
 
 ## Usage
@@ -38,6 +39,12 @@ tcpflow -r prometheus_requests.pcap -o ./tcpflow_output
 ### Load data into the GrpeitmeDB
 ```bash
 loader -t <tcpflow_output_file> -url http://localhost:4000/v1/prometheus/write?db=public
+```
+
+The input capture remains a Prometheus remote write capture. To emit generated samples as OTLP Metrics to a standard OTLP HTTP receiver:
+
+```bash
+loader -t <tcpflow_output_file> --url http://localhost:4318/v1/metrics --protocol otlp
 ```
 
 ## Example

@@ -1,13 +1,13 @@
 package loader
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"metrics-bench-suite/pkg/http"
 	"metrics-bench-suite/pkg/parser"
 	"metrics-bench-suite/pkg/timeseries"
 	"metrics-bench-suite/pkg/utils/decode"
-	"sync"
 	"time"
 
 	"math/rand"
@@ -30,6 +30,7 @@ type Loader struct {
 	MetricScale          int
 	LabelScale           int
 	Seed                 int
+	Protocol             string
 }
 
 // Run is the main function for the loader
@@ -45,6 +46,10 @@ func (l *Loader) Run(cmd *cobra.Command, args []string) error {
 	l.SampleScale, _ = cmd.Flags().GetInt("sample-scale")
 	l.MetricScale, _ = cmd.Flags().GetInt("metric-scale")
 	l.LabelScale, _ = cmd.Flags().GetInt("label-scale")
+	l.Protocol, _ = cmd.Flags().GetString("protocol")
+	if _, err := http.NewRequesterForProtocol(l.URL, l.Protocol); err != nil {
+		return err
+	}
 	interval, err := time.ParseDuration(intervalStr)
 	if err != nil {
 		return err
@@ -67,6 +72,7 @@ func (l *Loader) Run(cmd *cobra.Command, args []string) error {
 	log.Printf("Sample scale: %d", l.SampleScale)
 	log.Printf("Metric scale: %d", l.MetricScale)
 	log.Printf("Label scale: %d", l.LabelScale)
+	log.Printf("Protocol: %s", l.Protocol)
 	r := rand.New(rand.NewSource(int64(l.Seed)))
 
 	wrSet, err := l.getAllRemoteWriteRequest()
@@ -106,7 +112,7 @@ func (l *Loader) Run(cmd *cobra.Command, args []string) error {
 		tsSet = ScaleLabels(tsSet, l.LabelScale)
 		err = l.process(tsSet)
 		if err != nil {
-			log.Printf("failed to send write request: %v", err)
+			return fmt.Errorf("failed to send metrics: %w", err)
 		}
 	}
 
@@ -157,32 +163,30 @@ func ScaleLabels(tsSet []prompb.TimeSeries, scale int) []prompb.TimeSeries {
 }
 
 func (l *Loader) sendWriteRequest(tsSet []prompb.TimeSeries) error {
-	r := http.NewRequester(l.URL)
-	wr := prompb.WriteRequest{
-		Timeseries: tsSet,
+	r, err := http.NewRequesterForProtocol(l.URL, l.Protocol)
+	if err != nil {
+		return err
 	}
-	return r.Send(wr)
+	return r.SendTimeSeries(tsSet)
 }
 
 func (l *Loader) process(tsSet []prompb.TimeSeries) error {
-	wg := sync.WaitGroup{}
 	now := time.Now()
 	total := len(tsSet)
 	chunks := slices.Collect(slices.Chunk(tsSet, l.TimeseriesPerRequest))
 	log.Printf("Sending %d chunks, chunk size: %d, total time series: %d, total samples: %d", len(chunks), l.TimeseriesPerRequest, total/l.SampleScale, total)
+	errorsByChunk := make(chan error, len(chunks))
 	for _, chunk := range chunks {
-		wg.Add(1)
 		go func(chunk []prompb.TimeSeries) {
-			defer wg.Done()
-			err := l.sendWriteRequest(chunk)
-			if err != nil {
-				log.Printf("failed to send write request: %v", err)
-			}
+			errorsByChunk <- l.sendWriteRequest(chunk)
 		}(chunk)
 	}
-	wg.Wait()
+	var sendErr error
+	for range len(chunks) {
+		sendErr = errors.Join(sendErr, <-errorsByChunk)
+	}
 	log.Printf("Processed %d time series in %s", total, time.Since(now))
-	return nil
+	return sendErr
 }
 
 func (l *Loader) buildFactorySet(tsSet []timeseries.TimeSerie, r *rand.Rand) (timeseries.FactorySet, error) {
@@ -270,6 +274,7 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().IntP("sample-scale", "", 1, "The scale of the samples")
 	rootCmd.Flags().IntP("metric-scale", "", 1, "The scale of the metrics")
 	rootCmd.Flags().IntP("label-scale", "", 1, "The scale of the labels")
+	rootCmd.Flags().String("protocol", http.ProtocolPrometheus, "Metrics write protocol (prometheus or otlp)")
 
 	return rootCmd
 }

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 	"metrics-bench-suite/pkg/samples"
-	"net/http"
+	stdhttp "net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -14,11 +14,12 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/prometheus/prompb"
+	"google.golang.org/protobuf/encoding/protowire"
+	benchhttp "metrics-bench-suite/pkg/http"
 )
 
 func TestAuthorizationHeader(t *testing.T) {
@@ -488,7 +489,7 @@ func TestDurationStopsBlockedGeneration(t *testing.T) {
 func TestWorkerCancelsAfterDrainTimeout(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	server := httptest.NewServer(stdhttp.HandlerFunc(func(stdhttp.ResponseWriter, *stdhttp.Request) {
 		close(started)
 		<-release
 	}))
@@ -501,12 +502,19 @@ func TestWorkerCancelsAfterDrainTimeout(t *testing.T) {
 	requestChan <- prompb.WriteRequest{}
 	close(requestChan)
 
-	var (
-		wg    sync.WaitGroup
-		stats runStats
-	)
-	wg.Add(1)
-	go worker(requestCtx, 0, server.URL, "", remoteWriteV1, requestChan, &wg, false, &stats)
+	requester := benchhttp.NewRequester(server.URL)
+	var stats runStats
+	workerErrors := make(chan error, 1)
+	worker := sampleWorker{
+		id:        0,
+		ctx:       requestCtx,
+		requester: requester,
+		protocol:  benchhttp.ProtocolPrometheus,
+		version:   remoteWriteV1,
+		stats:     newWriteStats(time.Now()),
+		runStats:  &stats,
+	}
+	go func() { workerErrors <- worker.run(requestChan) }()
 
 	select {
 	case <-started:
@@ -514,7 +522,7 @@ func TestWorkerCancelsAfterDrainTimeout(t *testing.T) {
 		t.Fatal("worker did not start its request")
 	}
 
-	waitForWorkers(&wg, cancelRequests, 20*time.Millisecond)
+	_ = waitForWorkers(workerErrors, 1, cancelRequests, 20*time.Millisecond)
 	if stats.failedRequests != 1 {
 		t.Fatalf("expected the canceled request to fail, got %+v", stats)
 	}
@@ -628,5 +636,88 @@ func TestGenerateTimeSeriesForFileConfigReplicaLabel(t *testing.T) {
 
 	if ts.Labels[2].Value != "2" {
 		t.Fatalf("Expected replica label value to be %q, got %q", "2", ts.Labels[2].Value)
+	}
+}
+
+func TestWorkerReturnsRequestErrors(t *testing.T) {
+	server := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
+		stdhttp.Error(w, "rejected", stdhttp.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	requester, err := benchhttp.NewRequesterForProtocol(server.URL, benchhttp.ProtocolPrometheus)
+	if err != nil {
+		t.Fatalf("create requester: %v", err)
+	}
+	requests := make(chan prompb.WriteRequest, 1)
+	requests <- prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels:  []prompb.Label{{Name: "__name__", Value: "metric"}},
+		Samples: []prompb.Sample{{Value: 1, Timestamp: 1}},
+	}}}
+	close(requests)
+
+	worker := sampleWorker{id: 0, requester: requester, stats: newWriteStats(time.Now())}
+	if err := worker.run(requests); err == nil {
+		t.Fatal("expected worker request error")
+	}
+}
+
+func TestWorkerRecordsSuccessfullyWrittenRows(t *testing.T) {
+	server := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
+		w.WriteHeader(stdhttp.StatusNoContent)
+	}))
+	defer server.Close()
+
+	requester, err := benchhttp.NewRequesterForProtocol(server.URL, benchhttp.ProtocolPrometheus)
+	if err != nil {
+		t.Fatalf("create requester: %v", err)
+	}
+	requests := make(chan prompb.WriteRequest, 1)
+	requests <- prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{Samples: []prompb.Sample{{Value: 1}, {Value: 2}}},
+		{Samples: []prompb.Sample{{Value: 3}}},
+	}}
+	close(requests)
+
+	startedAt := time.Now()
+	stats := newWriteStats(startedAt)
+	worker := sampleWorker{id: 0, requester: requester, stats: stats}
+	if err := worker.run(requests); err != nil {
+		t.Fatalf("run worker: %v", err)
+	}
+	snapshot := stats.snapshot(time.Now())
+	if snapshot.totalRows != 3 || !snapshot.hasRequests {
+		t.Fatalf("unexpected worker stats: rows=%d has_requests=%t", snapshot.totalRows, snapshot.hasRequests)
+	}
+}
+
+func TestWorkerCountsRowsAcceptedByOTLPPartialSuccess(t *testing.T) {
+	partialSuccess := protowire.AppendTag(nil, 1, protowire.VarintType)
+	partialSuccess = protowire.AppendVarint(partialSuccess, 1)
+	response := protowire.AppendTag(nil, 1, protowire.BytesType)
+	response = protowire.AppendBytes(response, partialSuccess)
+	server := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
+		_, _ = w.Write(response)
+	}))
+	defer server.Close()
+
+	requester, err := benchhttp.NewRequesterForProtocol(server.URL, benchhttp.ProtocolOTLP)
+	if err != nil {
+		t.Fatalf("create requester: %v", err)
+	}
+	requests := make(chan prompb.WriteRequest, 1)
+	requests <- prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels:  []prompb.Label{{Name: "__name__", Value: "metric"}},
+		Samples: []prompb.Sample{{Value: 1}, {Value: 2}, {Value: 3}},
+	}}}
+	close(requests)
+
+	stats := newWriteStats(time.Now())
+	worker := sampleWorker{id: 0, requester: requester, stats: stats}
+	if err := worker.run(requests); err == nil {
+		t.Fatal("expected partial success error")
+	}
+	if rows := stats.snapshot(time.Now()).totalRows; rows != 2 {
+		t.Fatalf("written rows = %d, want 2", rows)
 	}
 }

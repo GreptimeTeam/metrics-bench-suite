@@ -6,6 +6,7 @@ require (
 	github.com/golang/snappy v0.0.4
 	github.com/prometheus/prometheus v0.301.0
 	github.com/xitongsys/parquet-go-source v0.0.0-20200817004010-026bad9b25d0
+	go.opentelemetry.io/proto/otlp v1.4.0
 	google.golang.org/protobuf v1.36.2
 	gopkg.in/yaml.v3 v3.0.1
 )

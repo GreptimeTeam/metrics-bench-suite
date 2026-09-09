@@ -21,15 +21,17 @@ import (
 
 // SampleGenerator is a struct that generates samples from a config file
 type SampleGenerator struct {
-	ConfigPath     string
-	Interval       time.Duration
-	StartDate      time.Time
-	EndDate        time.Time
-	Seed           int
-	OutputDir      string
-	RemoteWriteURL string
-	Database       string
-	Table          string
+	ConfigPath           string
+	Interval             time.Duration
+	StartDate            time.Time
+	EndDate              time.Time
+	Seed                 int
+	OutputDir            string
+	RemoteWriteURL       string
+	Database             string
+	Table                string
+	Protocol             string
+	MaxSamplesPerRequest int
 }
 
 type metric struct {
@@ -79,12 +81,24 @@ func (s *SampleGenerator) run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	s.Protocol, err = cmd.Flags().GetString("protocol")
+	if err != nil {
+		return err
+	}
+	s.MaxSamplesPerRequest, err = cmd.Flags().GetInt("max-samples-per-request")
+	if err != nil {
+		return err
+	}
+	if s.MaxSamplesPerRequest <= 0 {
+		return fmt.Errorf("max-samples-per-request must be greater than zero")
+	}
 	log.Printf("Start date: %s", s.StartDate)
 	log.Printf("End date: %s", s.EndDate)
 	log.Printf("Interval: %s", s.Interval)
 	log.Printf("Seed: %d", s.Seed)
 	log.Printf("Config path: %s", s.ConfigPath)
 	log.Printf("Output dir: %s", s.OutputDir)
+	log.Printf("Max samples per request: %d", s.MaxSamplesPerRequest)
 
 	fileConfigs, err := samples.WalkAndParseConfig(s.ConfigPath)
 	if err != nil {
@@ -124,11 +138,16 @@ func (s *SampleGenerator) run(cmd *cobra.Command, args []string) error {
 	log.Printf("total time series: %d, for %d metrics", totalCount, len(metrics))
 
 	if s.RemoteWriteURL != "" {
-		log.Printf("Sending metrics to remote write...")
+		log.Printf("Sending metrics using %s protocol...", s.Protocol)
 		wr := convertToRemoteWriteRequest(metrics, s.StartDate, s.EndDate, s.Interval)
-		err = http.NewRequester(s.RemoteWriteURL).Send(wr)
+		requester, err := http.NewRequesterForProtocol(s.RemoteWriteURL, s.Protocol)
 		if err != nil {
-			return fmt.Errorf("failed to send metrics to remote write: %w", err)
+			return err
+		}
+		for i, batch := range splitTimeSeriesBySampleCount(wr.Timeseries, s.MaxSamplesPerRequest) {
+			if err := requester.SendTimeSeries(batch); err != nil {
+				return fmt.Errorf("failed to send metrics batch %d: %w", i, err)
+			}
 		}
 	} else {
 		log.Printf("Saving metrics to file...")
@@ -230,6 +249,32 @@ func convertToRemoteWriteRequest(metrics []metric, start time.Time, end time.Tim
 	}
 }
 
+func splitTimeSeriesBySampleCount(timeSeries []prompb.TimeSeries, maxSamples int) [][]prompb.TimeSeries {
+	batches := make([][]prompb.TimeSeries, 0)
+	batch := make([]prompb.TimeSeries, 0)
+	sampleCount := 0
+	for _, series := range timeSeries {
+		remaining := series.Samples
+		for len(remaining) > 0 {
+			take := min(maxSamples-sampleCount, len(remaining))
+			part := series
+			part.Samples = remaining[:take]
+			batch = append(batch, part)
+			remaining = remaining[take:]
+			sampleCount += take
+			if sampleCount == maxSamples {
+				batches = append(batches, batch)
+				batch = make([]prompb.TimeSeries, 0)
+				sampleCount = 0
+			}
+		}
+	}
+	if len(batch) > 0 {
+		batches = append(batches, batch)
+	}
+	return batches
+}
+
 var timeFormat = "2006-01-02T150405Z"
 
 func (s *SampleGenerator) fileName() string {
@@ -261,6 +306,8 @@ func NewCommand() *cobra.Command {
 	rootCmd.Flags().IntP("seed", "s", 123456, "The seed for the random number generator")
 	rootCmd.Flags().StringP("remote-write-url", "u", "", "The remote write url")
 	rootCmd.Flags().StringP("output-dir", "o", "", "The output directory")
+	rootCmd.Flags().String("protocol", http.ProtocolPrometheus, "Metrics write protocol (prometheus or otlp)")
+	rootCmd.Flags().Int("max-samples-per-request", 10000, "The maximum number of data points per metrics request")
 
 	return rootCmd
 }
