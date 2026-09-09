@@ -52,6 +52,28 @@ spec:
             {{- else if not .Values.sampleLoader.dryRun }}
             {{- fail "sampleLoader.remoteWriteUrl is required unless sampleLoader.dryRun is true" }}
             {{- end }}
+            {{- if and (eq .Values.sampleLoader.protocol "otlp") (ne .Values.sampleLoader.remoteWriteVersion "v1") }}
+            {{- fail "sampleLoader.remoteWriteVersion must be v1 when sampleLoader.protocol is otlp" }}
+            {{- end }}
+            - --remote-write-version
+            - {{ .Values.sampleLoader.remoteWriteVersion | quote }}
+            {{- if and .Values.basicAuth.existingSecret (or .Values.sampleLoader.username .Values.sampleLoader.password) }}
+            {{- fail "basicAuth.existingSecret cannot be combined with sampleLoader.username or sampleLoader.password" }}
+            {{- end }}
+            {{- if .Values.basicAuth.existingSecret }}
+            - --username
+            - $(BASIC_AUTH_USERNAME)
+            - --password
+            - $(BASIC_AUTH_PASSWORD)
+            {{- else if or .Values.sampleLoader.username .Values.sampleLoader.password }}
+            {{- if not (and .Values.sampleLoader.username .Values.sampleLoader.password) }}
+            {{- fail "sampleLoader.username and sampleLoader.password must be provided together" }}
+            {{- end }}
+            - --username
+            - {{ .Values.sampleLoader.username | quote }}
+            - --password
+            - {{ .Values.sampleLoader.password | quote }}
+            {{- end }}
             - --start-date
             - {{ .Values.sampleLoader.startDate | quote }}
             - --end-date
@@ -73,6 +95,13 @@ spec:
             {{- if .Values.sampleLoader.infinite }}
             - --infinite
             {{- end }}
+            {{- if .Values.sampleLoader.duration }}
+            {{- if .Values.sampleLoader.infinite }}
+            {{- fail "sampleLoader.duration and sampleLoader.infinite cannot be used together" }}
+            {{- end }}
+            - --duration
+            - {{ .Values.sampleLoader.duration | quote }}
+            {{- end }}
             - --table-pick-count
             {{- if and (eq (len .Values.sampleLoader.tablePickCount) 20) (gt .Values.sampleLoader.tablePickCount "18446744073709551615") }}
             {{- fail "sampleLoader.tablePickCount must not exceed 18446744073709551615" }}
@@ -87,12 +116,26 @@ spec:
             - {{ .Values.sampleLoader.churnInterval | quote }}
             - --protocol
             - {{ .Values.sampleLoader.protocol | quote }}
-          {{- if .Values.sampleLoader.replicaFromJobCompletionIndex }}
+          {{- if or .Values.sampleLoader.replicaFromJobCompletionIndex .Values.basicAuth.existingSecret }}
           env:
+            {{- if .Values.sampleLoader.replicaFromJobCompletionIndex }}
             - name: REPLICA_INDEX
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            {{- end }}
+            {{- if .Values.basicAuth.existingSecret }}
+            - name: BASIC_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.basicAuth.existingSecret | quote }}
+                  key: {{ .Values.basicAuth.usernameKey | quote }}
+            - name: BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.basicAuth.existingSecret | quote }}
+                  key: {{ .Values.basicAuth.passwordKey | quote }}
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

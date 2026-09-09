@@ -38,4 +38,4 @@ helm upgrade --install metrics-loader ./tools/metrics-loader \
   --set sampleLoader.dryRun=true
 ```
 
-Set `sampleLoader.infinite=false` with `sampleLoader.startDate` and `sampleLoader.endDate` for a finite run. See [`tools/metrics-loader/README.md`](tools/metrics-loader/README.md) for all values and their corresponding `sample_loader` arguments.
+Set `sampleLoader.infinite=false` with `sampleLoader.startDate` and `sampleLoader.endDate` for a finite historical run. For a bounded run starting now, also disable `sampleLoader.infinite` and set `sampleLoader.duration`. See [`tools/metrics-loader/README.md`](tools/metrics-loader/README.md) for all values, Basic Auth Secret configuration, and their corresponding `sample_loader` arguments.

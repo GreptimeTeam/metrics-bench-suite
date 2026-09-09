@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: greptime-registry.cn-hangzhou.cr.aliyuncs.com/tools/metrics-bench-suite
-  tag: "0.3.2"
+  tag: "0.3.3"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -19,6 +19,12 @@ job:
   ttlSecondsAfterFinished: null
   annotations: {}
 
+# Prefer an existing Secret over sampleLoader.username/password in production.
+basicAuth:
+  existingSecret: ""
+  usernameKey: username
+  passwordKey: password
+
 podAnnotations: {}
 podLabels: {}
 podSecurityContext: {}
@@ -34,6 +40,11 @@ sampleLoader:
   # Required unless dryRun is true. This can be a Prometheus remote write or
   # OTLP HTTP/protobuf endpoint, depending on protocol.
   remoteWriteUrl: ""
+  remoteWriteVersion: v1
+  # Direct credentials are exposed in Helm values and the Pod manifest. Use
+  # basicAuth.existingSecret instead for production credentials.
+  username: ""
+  password: ""
   startDate: "2025-01-01T00:00:00Z"
   endDate: "2025-01-01T00:01:00Z"
   interval: "30s"
@@ -45,6 +56,9 @@ sampleLoader:
   replicaFromJobCompletionIndex: true
   replica: 0
   infinite: true
+  # Set a positive Go duration and disable infinite to run from now for a
+  # bounded wall-clock duration. Empty means the flag is not passed.
+  duration: ""
   tablePickCount: "18446744073709551615"
   dryRun: false
   churnRate: 0
