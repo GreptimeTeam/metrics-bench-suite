@@ -67,11 +67,34 @@ func (f *FileConfig) processSingleFileConfigSeries(
 	series := seriesWithIndex.Series
 	index := seriesWithIndex.Index
 
+	ts := prompb.TimeSeries{Labels: BuildSeriesLabels(f.Name, series, replicaInsertIndex, f.shouldChurn(seriesIdx), churnEpoch, replica)}
+
+	generator := f.GetOrCreateFieldGenerator(index)
+	value := generator.Next()
+
+	ts.Samples = append(ts.Samples, prompb.Sample{
+		Value:     value,
+		Timestamp: current.UnixMilli(),
+	})
+	return ts
+}
+
+func (f *FileConfig) shouldChurn(seriesIdx int) bool {
+	if len(f.ChurnIndices) == 0 {
+		return false
+	}
+	i := sort.SearchInts(f.ChurnIndices, seriesIdx)
+	return i < len(f.ChurnIndices) && f.ChurnIndices[i] == seriesIdx
+}
+
+// BuildSeriesLabels constructs the same ordered labels for live and offline
+// generation. Input label pairs must be sorted and validated.
+func BuildSeriesLabels(metricName string, series []LabelPair, replicaInsertIndex int, churn bool, churnEpoch int64, replica int) []prompb.Label {
 	ts := prompb.TimeSeries{
 		Labels: []prompb.Label{
 			{
 				Name:  "__name__",
-				Value: f.Name,
+				Value: metricName,
 			},
 		},
 		Samples: make([]prompb.Sample, 0),
@@ -101,7 +124,7 @@ func (f *FileConfig) processSingleFileConfigSeries(
 		})
 	}
 
-	if f.shouldChurn(seriesIdx) {
+	if churn {
 		churnLabel := prompb.Label{
 			Name:  "churn_id",
 			Value: fmt.Sprintf("epoch_%d", churnEpoch),
@@ -113,20 +136,10 @@ func (f *FileConfig) processSingleFileConfigSeries(
 		ts.Labels = append(ts.Labels[:insertIdx], append([]prompb.Label{churnLabel}, ts.Labels[insertIdx:]...)...)
 	}
 
-	generator := f.GetOrCreateFieldGenerator(index)
-	value := generator.Next()
-
-	ts.Samples = append(ts.Samples, prompb.Sample{
-		Value:     value,
-		Timestamp: current.UnixMilli(),
-	})
-	return ts
-}
-
-func (f *FileConfig) shouldChurn(seriesIdx int) bool {
-	if len(f.ChurnIndices) == 0 {
-		return false
+	// Tags are already ordered. Only names sorting before __name__ (for
+	// example uppercase labels) require repositioning the metric label.
+	if len(ts.Labels) > 1 && ts.Labels[1].Name < "__name__" {
+		sort.Slice(ts.Labels, func(i, j int) bool { return ts.Labels[i].Name < ts.Labels[j].Name })
 	}
-	i := sort.SearchInts(f.ChurnIndices, seriesIdx)
-	return i < len(f.ChurnIndices) && f.ChurnIndices[i] == seriesIdx
+	return ts.Labels
 }

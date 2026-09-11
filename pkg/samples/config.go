@@ -232,3 +232,22 @@ func (d Distribution) FieldGenerator() FloatGenerator {
 
 	return nil
 }
+
+// FieldGeneratorWithRandom uses the existing distribution semantics with a
+// caller-owned random source. The distribution must already be validated.
+func (d Distribution) FieldGeneratorWithRandom(source RandomSource) FloatGenerator {
+	generator := d.FieldGenerator()
+	switch g := generator.(type) {
+	case *RandomFloat:
+		g.source = source
+	case *RandomInt:
+		g.source = source
+	case *Normal:
+		g.source = source
+	case *Uniform:
+		g.source = source
+	case *Noisy:
+		g.source = source
+	}
+	return generator
+}

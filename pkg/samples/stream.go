@@ -64,3 +64,9 @@ func tagSetPermutationStream(labels []LabelCandidates, fn func(SeriesWithIndex) 
 		}
 	}
 }
+
+// VisitTagSets visits label permutations without retaining them and stops when
+// fn returns false. Callers can stop on cancellation or output errors.
+func VisitTagSets(labels []LabelCandidates, fn func(SeriesWithIndex) bool) {
+	tagSetPermutationStream(labels, fn)
+}

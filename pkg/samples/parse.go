@@ -116,11 +116,17 @@ func computeSeriesCount(tags []Tag) int {
 // Indices are deterministic: they are assigned based on per-file series counts, sorted by
 // file name for remainder distribution, and each file gets the lowest indices [0..N-1].
 func AssignChurnIndices(fileConfigs []FileConfig, churnRate float64) {
+	for i, count := range ChurnCounts(fileConfigs, churnRate) {
+		fileConfigs[i].ChurnIndices = buildChurnIndices(count)
+	}
+}
+
+// ChurnCounts returns the size of each metric's deterministic prefix of churned
+// series without allocating an index for every selected series.
+func ChurnCounts(fileConfigs []FileConfig, churnRate float64) []int {
+	counts := make([]int, len(fileConfigs))
 	if churnRate <= 0 || len(fileConfigs) == 0 {
-		for i := range fileConfigs {
-			fileConfigs[i].ChurnIndices = nil
-		}
-		return
+		return counts
 	}
 
 	totalSeries := 0
@@ -131,7 +137,7 @@ func AssignChurnIndices(fileConfigs []FileConfig, churnRate float64) {
 		totalSeries += fileConfigs[i].SeriesCount
 	}
 	if totalSeries == 0 {
-		return
+		return counts
 	}
 
 	target := int(math.Round(churnRate * float64(totalSeries)))
@@ -163,7 +169,7 @@ func AssignChurnIndices(fileConfigs []FileConfig, churnRate float64) {
 		if share > remaining {
 			share = remaining
 		}
-		fileConfigs[ref.index].ChurnIndices = buildChurnIndices(share)
+		counts[ref.index] = share
 		remaining -= share
 	}
 
@@ -171,9 +177,11 @@ func AssignChurnIndices(fileConfigs []FileConfig, churnRate float64) {
 		if remaining == 0 {
 			break
 		}
-		fileConfigs[ref.index].ChurnIndices = append(fileConfigs[ref.index].ChurnIndices, len(fileConfigs[ref.index].ChurnIndices))
+		counts[ref.index]++
 		remaining--
 	}
+
+	return counts
 }
 
 func buildChurnIndices(count int) []int {
