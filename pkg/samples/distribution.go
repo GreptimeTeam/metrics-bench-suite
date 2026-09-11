@@ -6,6 +6,26 @@ import (
 	"golang.org/x/exp/rand"
 )
 
+// RandomSource lets offline datasets use a private random stream per series.
+// Existing generators continue to use the package random source by default.
+type RandomSource interface {
+	Float64() float64
+	Intn(int) int
+	NormFloat64() float64
+}
+
+type globalRandomSource struct{}
+
+func (globalRandomSource) Float64() float64     { return rand.Float64() }
+func (globalRandomSource) Intn(n int) int       { return rand.Intn(n) }
+func (globalRandomSource) NormFloat64() float64 { return rand.NormFloat64() }
+func randomSource(source RandomSource) RandomSource {
+	if source == nil {
+		return globalRandomSource{}
+	}
+	return source
+}
+
 // LabelGenerator is an interface that represents a label generator.
 type LabelGenerator interface {
 	Next() string
@@ -65,13 +85,14 @@ func NewMonoInc(step int, lowerBound *float64, upperBound *float64) *MonoInc {
 
 // RandomFloat is a struct that represents a random float.
 type RandomFloat struct {
+	source     RandomSource
 	lowerBound float64
 	upperBound float64
 }
 
 // Next returns a random value from the float distribution.
 func (r *RandomFloat) Next() float64 {
-	return rand.Float64()*(r.upperBound-r.lowerBound) + r.lowerBound
+	return randomSource(r.source).Float64()*(r.upperBound-r.lowerBound) + r.lowerBound
 }
 
 // NewRandom creates a new RandomFloat
@@ -84,13 +105,14 @@ func NewRandom(lowerBound float64, upperBound float64) *RandomFloat {
 
 // RandomInt is a struct that represents a random integer.
 type RandomInt struct {
+	source     RandomSource
 	lowerBound int
 	upperBound int
 }
 
 // Next returns a random integer.
 func (r *RandomInt) Next() float64 {
-	return float64(rand.Intn(r.upperBound-r.lowerBound) + r.lowerBound)
+	return float64(randomSource(r.source).Intn(r.upperBound-r.lowerBound) + r.lowerBound)
 }
 
 // NewRandomInt creates a new RandomInt
@@ -144,13 +166,14 @@ func NewConstantFloat(value float64) *ConstantFloat {
 
 // Normal is a struct that represents a normal distribution.
 type Normal struct {
+	source RandomSource
 	mean   float64
 	stddev float64
 }
 
 // Next returns a random value from the normal distribution.
 func (n *Normal) Next() float64 {
-	return rand.NormFloat64()*n.stddev + n.mean
+	return randomSource(n.source).NormFloat64()*n.stddev + n.mean
 }
 
 // NewNormal creates a new Normal
@@ -160,13 +183,14 @@ func NewNormal(mean float64, stddev float64) *Normal {
 
 // Uniform is a struct that represents a uniform distribution.
 type Uniform struct {
+	source     RandomSource
 	lowerBound float64
 	upperBound float64
 }
 
 // Next returns a random value from the uniform distribution.
 func (u *Uniform) Next() float64 {
-	return rand.Float64()*(u.upperBound-u.lowerBound) + u.lowerBound
+	return randomSource(u.source).Float64()*(u.upperBound-u.lowerBound) + u.lowerBound
 }
 
 // NewUniform creates a new Uniform
@@ -176,6 +200,7 @@ func NewUniform(lowerBound float64, upperBound float64) *Uniform {
 
 // Noisy is a struct that represents a noisy distribution.
 type Noisy struct {
+	source         RandomSource
 	current        float64
 	maxFluctuation int
 }
@@ -183,7 +208,7 @@ type Noisy struct {
 // Next returns a random value from the noisy distribution.
 func (n *Noisy) Next() float64 {
 	value := n.current
-	n.current += rand.Float64()*float64(2*n.maxFluctuation) - float64(n.maxFluctuation)
+	n.current += randomSource(n.source).Float64()*float64(2*n.maxFluctuation) - float64(n.maxFluctuation)
 	return value
 }
 

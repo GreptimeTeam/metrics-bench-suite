@@ -10,6 +10,14 @@ Metrics Bench Suite is a set of tools designed to benchmark the storage and quer
 
 The writing tools accept `--protocol prometheus` (the default) or `--protocol otlp`. Generated scalar time series are encoded as OTLP Gauge metrics; `__name__` becomes the metric name, other labels become string attributes, and timestamps are converted from milliseconds to nanoseconds.
 
+## Reusable historical datasets
+
+Use [`metrics_dataset`](cmd/metrics_dataset/README.md) to inspect configs and
+produce deterministic remote-write files for O11yBench or another offline
+loader. The [curated profiles and inventory](profiles/README.md) organize existing
+config sets without changing them. Generation supports an explicit seed and
+sample-time churn; `verify` checks the finished dataset before reuse.
+
 ## Helm Chart
 
 Deploy `sample_loader` as an Indexed Kubernetes Job. Each Job completion uses its completion index as the replica label, so parallel writers generate distinct series.
