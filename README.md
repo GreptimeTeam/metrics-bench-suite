@@ -14,8 +14,8 @@ The writing tools accept `--protocol prometheus` (the default) or `--protocol ot
 
 Use [`metrics_dataset`](cmd/metrics_dataset/README.md) to inspect configs and
 produce deterministic remote-write files for O11yBench or another offline
-loader. The [curated profiles and inventory](profiles/README.md) organize existing
-config sets without changing them. Generation supports an explicit seed and
+loader. The [curated profiles and inventory](profiles/README.md) provide corrected scalar
+value behavior while preserving legacy config sets. Generation supports an explicit seed and
 sample-time churn; `verify` checks the finished dataset before reuse.
 
 ## Helm Chart

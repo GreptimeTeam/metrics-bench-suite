@@ -98,4 +98,4 @@ python3 scripts/catalog_metrics_profiles.py --output /tmp/metrics-catalog.json
 Dataset tests independently decode the wire files and exercise all distributions,
 reproducibility, batch changes, resets, historical churn, cancellation, and
 corrupt/incomplete output. See [the profile catalog](../../profiles/README.md)
-for exact copies and known invalid legacy collections.
+for corrected curated values, source lineage, and known invalid legacy collections.
