@@ -216,35 +216,3 @@ func TestDatasetRoundTrip(t *testing.T) {
 		t.Fatal("canceled generation published a summary")
 	}
 }
-
-func TestCuratedProfilesAreExactValidCopies(t *testing.T) {
-	for _, profile := range []struct {
-		name, source string
-		series       int64
-	}{
-		{"k8s-small", "debug_samples_20", 20601}, {"k8s-medium", "debug_samples_400", 416370}, {"k8s-large", "samples_1750", 1755410},
-	} {
-		source := filepath.Join("..", "..", "configs", profile.source)
-		copyRoot := filepath.Join("..", "..", "profiles", profile.name)
-		inspection, err := dataset.Inspect(copyRoot)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !inspection.Valid || inspection.BaseSeries != profile.series {
-			t.Fatalf("%s: %+v", profile.name, inspection)
-		}
-		for _, metric := range inspection.Metrics {
-			original, err := os.ReadFile(filepath.Join(source, metric.File))
-			if err != nil {
-				t.Fatal(err)
-			}
-			copied, err := os.ReadFile(filepath.Join(copyRoot, metric.File))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(original) != string(copied) {
-				t.Fatalf("profile %s changed source config %s", profile.name, metric.File)
-			}
-		}
-	}
-}

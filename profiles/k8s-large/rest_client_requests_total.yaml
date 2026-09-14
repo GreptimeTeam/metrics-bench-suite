@@ -123,6 +123,5 @@ fields:
       type: Float
       dist:
         type: mono_inc
-        lower_bound: 1
-        upper_bound: 1000
+        lower_bound: 0
         step: 10

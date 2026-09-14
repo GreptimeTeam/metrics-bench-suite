@@ -168,7 +168,5 @@ fields:
     - name: greptime_value
       type: Float
       dist:
-        type: mono_inc
-        lower_bound: 1
-        upper_bound: 1000
-        step: 10
+        type: constant_float
+        value: 1.0
