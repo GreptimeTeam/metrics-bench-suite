@@ -53,12 +53,8 @@ tags:
     - name: host_network
       type: String
       dist:
-        type: weighted_preset
-        preset:
-            - value: host_network0
-              weight: 1
-            - value: host_network1
-              weight: 1
+        type: constant_string
+        value: "false"
     - name: instance
       type: String
       dist:

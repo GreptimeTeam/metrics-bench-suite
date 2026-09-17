@@ -42,20 +42,13 @@ tags:
     - name: workload
       type: String
       dist:
-        type: replica_string
-        replica: 1
-        replica_prefix: workload-
+        type: constant_string
+        value: workload-0
     - name: workload_type
       type: String
       dist:
-        type: weighted_preset
-        preset:
-            - value: deployment
-              weight: 1
-            - value: daemonset
-              weight: 1
-            - value: statefulset
-              weight: 1
+        type: constant_string
+        value: deployment
 fields:
     - name: greptime_value
       type: Float

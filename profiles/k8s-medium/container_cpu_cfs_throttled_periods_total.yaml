@@ -97,4 +97,4 @@ fields:
       dist:
         type: mono_inc
         lower_bound: 0
-        step: 10
+        step: 1

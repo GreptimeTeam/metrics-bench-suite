@@ -103,6 +103,7 @@ var curatedMetricGroups = map[string][]string{
 	},
 	"cpu_rate": {
 		"node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate",
+		"node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate5m",
 	},
 	"gauge": {
 		"cluster:namespace:pod_cpu:active:kube_pod_container_resource_limits",
@@ -162,8 +163,8 @@ func curatedCategories(t *testing.T) map[string]string {
 			categories[name] = category
 		}
 	}
-	if len(categories) != 108 {
-		t.Fatalf("classified %d metrics, expected 108", len(categories))
+	if len(categories) != 109 {
+		t.Fatalf("classified %d metrics, expected 109", len(categories))
 	}
 	return categories
 }
@@ -181,7 +182,7 @@ func readCuratedConfig(t *testing.T, path string) samples.Config {
 	return config
 }
 
-func checkCuratedValues(t *testing.T, category string, dist samples.Distribution) {
+func checkCuratedValues(t *testing.T, name, category string, dist samples.Distribution) {
 	t.Helper()
 	expectedType := "uniform"
 	switch category {
@@ -199,7 +200,11 @@ func checkCuratedValues(t *testing.T, category string, dist samples.Distribution
 	if category == "counter" && dist.UpperBound != nil {
 		t.Fatal("counter must not wrap")
 	}
-	if upper > 0 && (dist.LowerBound == nil || *dist.LowerBound != 0 || dist.UpperBound == nil || *dist.UpperBound != upper) {
+	lower := 0.0
+	if name == "namespace_cpu:kube_pod_container_resource_requests:sum" {
+		lower = 1
+	}
+	if upper > 0 && (dist.LowerBound == nil || *dist.LowerBound != lower || dist.UpperBound == nil || *dist.UpperBound != upper) {
 		t.Fatalf("%s must use [0, %g)", category, upper)
 	}
 	// A private fixed seed keeps behavior checks deterministic. Sample beyond the
@@ -213,7 +218,11 @@ func checkCuratedValues(t *testing.T, category string, dist samples.Distribution
 		}
 		switch category {
 		case "counter":
-			if value != float64(i*10) {
+			step := 10
+			if name == "container_cpu_cfs_throttled_periods_total" {
+				step = 1
+			}
+			if value != float64(i*step) {
 				t.Fatalf("counter sample %d: %g", i, value)
 			}
 		case "info":
@@ -225,7 +234,7 @@ func checkCuratedValues(t *testing.T, category string, dist samples.Distribution
 				t.Fatalf("config error value: %g", value)
 			}
 		default:
-			if value < 0 || value >= upper {
+			if value < lower || value >= upper {
 				t.Fatalf("%s outside [0, %g): %g", category, upper, value)
 			}
 			if (category == "boolean" || category == "integer") && value != math.Trunc(value) {
@@ -250,9 +259,9 @@ func TestCuratedProfiles(t *testing.T) {
 		name, source string
 		series       int64
 	}{
-		{"k8s-small", "debug_samples_20", 20601},
-		{"k8s-medium", "debug_samples_400", 416370},
-		{"k8s-large", "samples_1750", 1755410},
+		{"k8s-small", "debug_samples_20", 20205},
+		{"k8s-medium", "debug_samples_400", 406610},
+		{"k8s-large", "samples_1750", 1747610},
 	} {
 		t.Run(profile.name, func(t *testing.T) {
 			root := filepath.Join("..", "..", "profiles", profile.name)
@@ -278,13 +287,17 @@ func TestCuratedProfiles(t *testing.T) {
 						t.Fatalf("unclassified metric %s", metric.Name)
 					}
 					dist := metric.Config.Fields[0].Dist
-					checkCuratedValues(t, category, dist)
+					checkCuratedValues(t, metric.Name, category, dist)
 					if first, ok := reference[metric.Name]; ok {
 						if !reflect.DeepEqual(first, dist) {
 							t.Fatal("value definition differs between profile sizes")
 						}
 					} else {
 						reference[metric.Name] = dist
+					}
+					// Dashboard inputs intentionally correct a few legacy label domains.
+					if metric.Name == "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate5m" || metric.Name == "namespace_workload_pod:kube_pod_owner:relabel" || metric.Name == "kube_pod_info" || metric.Name == "container_cpu_cfs_throttled_periods_total" {
+						return
 					}
 					original := readCuratedConfig(t, filepath.Join("..", "..", "configs", profile.source, metric.Name+".yaml"))
 					current := readCuratedConfig(t, filepath.Join(root, metric.Name+".yaml"))
@@ -354,5 +367,63 @@ func TestCuratedConstantsOffline(t *testing.T) {
 				t.Fatalf("%s: got %g, want %g", name, point.Value, want)
 			}
 		}
+	}
+}
+
+// The dashboard workload requires correlated label domains, unlike the legacy
+// Cartesian profiles. Validate every scale, including scales not loaded locally.
+func TestDashboardProfileRelationships(t *testing.T) {
+	for _, profile := range []string{"k8s-small", "k8s-medium", "k8s-large"} {
+		t.Run(profile, func(t *testing.T) {
+			read := func(name string) samples.Config {
+				return readCuratedConfig(t, filepath.Join("..", "..", "profiles", profile, name+".yaml"))
+			}
+			cpu := read("node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate5m")
+			oldCPU := read("node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate")
+			if !reflect.DeepEqual(cpu, oldCPU) {
+				t.Fatal("CPU recording dimensions changed")
+			}
+			owner := read("namespace_workload_pod:kube_pod_owner:relabel")
+			for _, tag := range owner.Tags {
+				if tag.Name != "namespace" && tag.Name != "pod" && tag.Dist.Len() != 1 {
+					t.Fatalf("owner dimension %s would duplicate a join key", tag.Name)
+				}
+				if tag.Name == "workload" && tag.Dist.Value != "workload-0" {
+					t.Fatal("unexpected workload")
+				}
+				if tag.Name == "workload_type" && tag.Dist.Value != "deployment" {
+					t.Fatal("unexpected workload type")
+				}
+			}
+			found := false
+			for _, tag := range read("kube_pod_info").Tags {
+				if tag.Name == "host_network" {
+					found = tag.Dist.Type == "constant_string" && tag.Dist.Value == "false"
+				}
+			}
+			if !found {
+				t.Fatal("host_network=false selector would be empty")
+			}
+			throttled, periods := read("container_cpu_cfs_throttled_periods_total"), read("container_cpu_cfs_periods_total")
+			if !reflect.DeepEqual(throttled.Tags, periods.Tags) {
+				t.Fatal("throttling label domains differ")
+			}
+			if *throttled.Fields[0].Dist.Step != 1 || *periods.Fields[0].Dist.Step != 10 {
+				t.Fatal("throttling ratio must be 0.1")
+			}
+			requests := read("namespace_cpu:kube_pod_container_resource_requests:sum")
+			if *requests.Fields[0].Dist.LowerBound <= 0 {
+				t.Fatal("CPU requests must stay positive")
+			}
+			for _, metric := range []string{"container_memory_rss", "container_network_receive_bytes_total", "container_cpu_cfs_periods_total"} {
+				values := map[string]interface{}{}
+				for _, tag := range read(metric).Tags {
+					values[tag.Name] = tag.Dist.Value
+				}
+				if values["job"] != "kubelet" || values["metrics_path"] != "/metrics/cadvisor" {
+					t.Fatalf("%s does not match cAdvisor selector", metric)
+				}
+			}
+		})
 	}
 }
