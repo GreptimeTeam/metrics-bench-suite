@@ -2,6 +2,7 @@ package dataset_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,6 +26,7 @@ func decode(t *testing.T, root string, limit int) map[string][]prompb.Sample {
 		t.Fatal(err)
 	}
 	sort.Strings(paths)
+	previousTimestamp := int64(-1)
 	result := map[string][]prompb.Sample{}
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
@@ -41,6 +43,10 @@ func decode(t *testing.T, root string, limit int) map[string][]prompb.Sample {
 		}
 		count := 0
 		for _, series := range request.Timeseries {
+			if len(series.Samples) != 1 || series.Samples[0].Timestamp < previousTimestamp {
+				t.Fatal("wire samples are not timestamp-major")
+			}
+			previousTimestamp = series.Samples[0].Timestamp
 			labels, _ := json.Marshal(series.Labels)
 			key := string(labels)
 			result[key] = append(result[key], series.Samples...)
@@ -51,7 +57,7 @@ func decode(t *testing.T, root string, limit int) map[string][]prompb.Sample {
 				}
 			}
 		}
-		if count == 0 || count > limit {
+		if count == 0 || count > limit || (path != paths[len(paths)-1] && count != limit) {
 			t.Fatalf("request sample limit: %d", count)
 		}
 	}
@@ -131,6 +137,9 @@ func TestDatasetRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if s.SampleOrder != dataset.TimestampMajor {
+				t.Fatal("missing timestamp-major contract")
+			}
 			decoded := decode(t, first, 5)
 			if verified.BaseSeries != 16 || verified.ActualSamples != 96 || verified.ActualSeries != scenario.unique || int64(len(decoded)) != scenario.unique {
 				t.Fatalf("unexpected dataset counts: %+v, decoded=%d", verified, len(decoded))
@@ -167,20 +176,25 @@ func TestDatasetRoundTrip(t *testing.T) {
 				t.Fatalf("decoded %d samples", count)
 			}
 			// Batching must not change the generated values, timestamps, or identities.
-			options.MaxSamples = 13
-			optionsDir := t.TempDir()
-			if _, err := dataset.Generate(context.Background(), config, optionsDir, options); err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(decoded, decode(t, optionsDir, 13)) {
-				t.Fatal("batch size changed logical samples")
+			for _, limit := range []int{1, 16, 19, 128} {
+				options.MaxSamples = limit
+				optionsDir := t.TempDir()
+				if _, err := dataset.Generate(context.Background(), config, optionsDir, options); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := dataset.Verify(context.Background(), optionsDir); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(decoded, decode(t, optionsDir, limit)) {
+					t.Fatalf("batch size %d changed logical samples", limit)
+				}
 			}
 			options.Seed++
 			different := t.TempDir()
 			if _, err := dataset.Generate(context.Background(), config, different, options); err != nil {
 				t.Fatal(err)
 			}
-			if reflect.DeepEqual(decoded, decode(t, different, 13)) {
+			if reflect.DeepEqual(decoded, decode(t, different, options.MaxSamples)) {
 				t.Fatal("seed did not affect random distributions")
 			}
 			// Integrity failures must not turn a damaged or incomplete dataset into a load.
@@ -214,5 +228,182 @@ func TestDatasetRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(out, "summary.json")); !os.IsNotExist(err) {
 		t.Fatal("canceled generation published a summary")
+	}
+}
+
+func TestVerifyRejectsInvalidSampleOrder(t *testing.T) {
+	config := fixture(t)
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, scenario := range []struct {
+		name  string
+		order string
+		omit  bool
+	}{
+		{name: "missing", omit: true},
+		{name: "empty"},
+		{name: "unknown", order: "unknown"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			output := t.TempDir()
+			summary, err := dataset.Generate(context.Background(), config, output, dataset.Options{
+				Start: start, End: start.Add(time.Second), IntervalMillis: 1000, MaxSamples: 10,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary.SampleOrder = scenario.order
+			// Recompute the canonical identity to reach ordering validation.
+			summary.DatasetID, summary.GenerationDurationSeconds = "", 0
+			identity, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary.DatasetID = fmt.Sprintf("%x", sha256.Sum256(identity))
+			manifest, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario.omit {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(manifest, &fields); err != nil {
+					t.Fatal(err)
+				}
+				delete(fields, "sample_order")
+				manifest, err = json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(output, "summary.json"), manifest, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := dataset.Verify(context.Background(), output); err == nil || !strings.Contains(err.Error(), "unsupported sample order") {
+				t.Fatalf("expected unsupported sample order, got %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsInvalidScrapes(t *testing.T) {
+	config := fixture(t)
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	options := dataset.Options{Start: start, End: start.Add(11 * time.Second), IntervalMillis: 2000, Seed: 42, Replica: 7, ChurnRate: 0.5, ChurnIntervalMillis: 4000, MaxSamples: 19}
+	for _, scenario := range []struct {
+		name string
+		edit func([]prompb.TimeSeries) []prompb.TimeSeries
+	}{
+		{"duplicate_first_scrape", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			series[1] = series[0]
+			return series
+		}},
+		{"duplicate_later_scrape", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			series[17] = series[16]
+			return series
+		}},
+		{"reordered_across_files", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			series[18], series[19] = series[19], series[18]
+			return series
+		}},
+		{"missing_sample", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			return append(series[:20], series[21:]...)
+		}},
+		{"missing_final_scrape", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			return series[:len(series)-16]
+		}},
+		{"incorrect_timestamp", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			series[20].Samples[0].Timestamp++
+			return series
+		}},
+		{"incorrect_churn_epoch", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			for i := range series[32].Labels {
+				if series[32].Labels[i].Name == "churn_id" {
+					series[32].Labels[i].Value = "epoch_0"
+				}
+			}
+			return series
+		}},
+		{"missing_churn_label", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			for i, label := range series[0].Labels {
+				if label.Name == "churn_id" {
+					series[0].Labels = append(series[0].Labels[:i], series[0].Labels[i+1:]...)
+					break
+				}
+			}
+			return series
+		}},
+		{"multiple_samples_per_entry", func(series []prompb.TimeSeries) []prompb.TimeSeries {
+			series[0].Samples = append(series[0].Samples, series[16].Samples...)
+			return append(series[:16], series[17:]...)
+		}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			original := t.TempDir()
+			summary, err := dataset.Generate(context.Background(), config, original, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var series []prompb.TimeSeries
+			for _, file := range summary.Files {
+				data, err := os.ReadFile(filepath.Join(original, file.Name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, err := snappy.Decode(nil, data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var request prompb.WriteRequest
+				if err := request.Unmarshal(raw); err != nil {
+					t.Fatal(err)
+				}
+				series = append(series, request.Timeseries...)
+			}
+			series = scenario.edit(series)
+			// Rewrite all integrity metadata so rejection must come from semantic
+			// verification, not a stale checksum, file inventory, or sample total.
+			output := t.TempDir()
+			summary.Files = nil
+			summary.ActualSamples, summary.RemoteWriteTotalBytes = 0, 0
+			for len(series) > 0 {
+				end, count := 0, int64(0)
+				for end < len(series) && count+int64(len(series[end].Samples)) <= int64(options.MaxSamples) {
+					count += int64(len(series[end].Samples))
+					end++
+				}
+				request := prompb.WriteRequest{Timeseries: series[:end]}
+				raw, err := request.Marshal()
+				if err != nil {
+					t.Fatal(err)
+				}
+				data := snappy.Encode(nil, raw)
+				file := dataset.File{Name: fmt.Sprintf("prw-%012d.bin", len(summary.Files)), Bytes: int64(len(data)), SHA256: fmt.Sprintf("%x", sha256.Sum256(data)), Samples: count}
+				if err := os.WriteFile(filepath.Join(output, file.Name), data, 0644); err != nil {
+					t.Fatal(err)
+				}
+				summary.Files = append(summary.Files, file)
+				summary.ActualSamples += count
+				summary.RemoteWriteTotalBytes += file.Bytes
+				series = series[end:]
+			}
+			summary.RemoteWriteFiles = len(summary.Files)
+			summary.DatasetID, summary.GenerationDurationSeconds = "", 0
+			identity, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary.DatasetID = fmt.Sprintf("%x", sha256.Sum256(identity))
+			manifest, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(output, "summary.json"), manifest, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := dataset.Verify(context.Background(), output); err == nil {
+				t.Fatal("invalid scrape sequence was accepted")
+			} else if strings.Contains(err.Error(), "checksum") || strings.Contains(err.Error(), "manifest") {
+				t.Fatalf("test did not reach semantic verification: %v", err)
+			}
+		})
 	}
 }

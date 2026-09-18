@@ -22,6 +22,7 @@ import (
 
 const Format = "prometheus-remote-write-v1-snappy"
 const SchemaVersion = 1
+const TimestampMajor = "timestamp-major"
 
 // Options fully specifies the sample sequence; milliseconds match the wire format.
 type Options struct {
@@ -109,6 +110,7 @@ type Summary struct {
 	RemoteWriteTotalBytes     int64     `json:"remote_write_total_bytes"`
 	Files                     []File    `json:"files"`
 	GenerationDurationSeconds float64   `json:"generation_duration_seconds"`
+	SampleOrder               string    `json:"sample_order"`
 }
 
 func (s Summary) identity() string {
@@ -117,8 +119,8 @@ func (s Summary) identity() string {
 	return jsonDigest(s)
 }
 
-// Generate streams one base series at a time. It never retains the Cartesian
-// product, the whole time range, or a random generator per base series.
+// Generate emits one scrape at a time, retaining per-series field state but
+// neither the Cartesian product of labels nor the sample history.
 func Generate(ctx context.Context, configPath, output string, options Options) (*Summary, error) {
 	if err := options.Validate(); err != nil {
 		return nil, err
@@ -148,7 +150,7 @@ func Generate(ctx context.Context, configPath, output string, options Options) (
 		return nil, fmt.Errorf("output directory must be empty: %s", output)
 	}
 	started := time.Now()
-	summary := &Summary{SchemaVersion: SchemaVersion, Format: Format, Generator: identity, Options: options, ConfigSHA256: inspection.ConfigSHA256, Metrics: inspection.Metrics, BaseSeries: inspection.BaseSeries, Files: []File{}}
+	summary := &Summary{SampleOrder: TimestampMajor, SchemaVersion: SchemaVersion, Format: Format, Generator: identity, Options: options, ConfigSHA256: inspection.ConfigSHA256, Metrics: inspection.Metrics, BaseSeries: inspection.BaseSeries, Files: []File{}}
 	batch := prompb.WriteRequest{}
 	batchSamples := 0
 	flush := func() error {
@@ -174,52 +176,52 @@ func Generate(ctx context.Context, configPath, output string, options Options) (
 		return nil
 	}
 	churnCounts := samples.ChurnCounts(inspection.configs, options.ChurnRate)
-	for i := range inspection.configs {
-		config := &inspection.configs[i]
-		labels := make([]samples.LabelCandidates, 0, len(config.Config.Tags))
+	candidates := make([][]samples.LabelCandidates, len(inspection.configs))
+	generators := make([][]samples.FloatGenerator, len(inspection.configs))
+	for i, config := range inspection.configs {
 		for _, tag := range config.Config.Tags {
-			labels = append(labels, samples.LabelCandidates{Name: tag.Name, Values: tag.Dist.LabelGenerator().All()})
+			candidates[i] = append(candidates[i], samples.LabelCandidates{Name: tag.Name, Values: tag.Dist.LabelGenerator().All()})
 		}
-		seriesIndex := 0
-		churnCount := churnCounts[i]
-		samples.VisitTagSets(labels, func(series samples.SeriesWithIndex) bool {
-			if err = ctx.Err(); err != nil {
-				return false
+		generators[i] = make([]samples.FloatGenerator, config.SeriesCount)
+	}
+	for sampleIndex := int64(0); sampleIndex < options.SamplesPerSeries(); sampleIndex++ {
+		timestamp := options.Start.UnixMilli() + sampleIndex*options.IntervalMillis
+		epoch, previousEpoch := int64(0), int64(0)
+		if options.ChurnRate > 0 {
+			epoch = sampleIndex * options.IntervalMillis / options.ChurnIntervalMillis
+			if sampleIndex > 0 {
+				previousEpoch = (sampleIndex - 1) * options.IntervalMillis / options.ChurnIntervalMillis
 			}
-			baseLabels := samples.BuildSeriesLabels(config.Name, series.Series, config.ReplicaInsertIndex, false, 0, options.Replica)
-			seedData, _ := json.Marshal(struct {
-				Seed   uint64
-				Labels []prompb.Label
-			}{options.Seed, baseLabels})
-			seedHash := sha256.Sum256(seedData)
-			generator := config.Config.Fields[0].Dist.FieldGeneratorWithRandom(rand.New(rand.NewSource(binary.LittleEndian.Uint64(seedHash[:8]))))
-			previousEpoch := int64(-1)
-			var currentLabels []prompb.Label
-			for sampleIndex := int64(0); sampleIndex < options.SamplesPerSeries(); sampleIndex++ {
+		}
+		for i := range inspection.configs {
+			config := &inspection.configs[i]
+			seriesIndex := 0
+			samples.VisitTagSets(candidates[i], func(series samples.SeriesWithIndex) bool {
 				if err = ctx.Err(); err != nil {
 					return false
 				}
-				timestamp := options.Start.UnixMilli() + sampleIndex*options.IntervalMillis
-				epoch := int64(0)
-				churn := seriesIndex < churnCount
-				if churn {
-					epoch = (timestamp - options.Start.UnixMilli()) / options.ChurnIntervalMillis
+				if sampleIndex == 0 {
+					baseLabels := samples.BuildSeriesLabels(config.Name, series.Series, config.ReplicaInsertIndex, false, 0, options.Replica)
+					seedData, _ := json.Marshal(struct {
+						Seed   uint64
+						Labels []prompb.Label
+					}{options.Seed, baseLabels})
+					seedHash := sha256.Sum256(seedData)
+					generators[i][seriesIndex] = config.Config.Fields[0].Dist.FieldGeneratorWithRandom(rand.New(rand.NewSource(binary.LittleEndian.Uint64(seedHash[:8]))))
 				}
-				if epoch != previousEpoch {
-					currentLabels = samples.BuildSeriesLabels(config.Name, series.Series, config.ReplicaInsertIndex, churn, epoch, options.Replica)
+				churn := seriesIndex < churnCounts[i]
+				if sampleIndex == 0 || (churn && epoch != previousEpoch) {
 					summary.ActualSeries++
 				}
-				if epoch != previousEpoch || batchSamples == 0 {
-					batch.Timeseries = append(batch.Timeseries, prompb.TimeSeries{Labels: currentLabels})
-				}
-				previousEpoch = epoch
-				value := generator.Next()
+				value := generators[i][seriesIndex].Next()
 				if math.IsNaN(value) || math.IsInf(value, 0) {
 					err = fmt.Errorf("metric %s produced nonfinite value", config.Name)
 					return false
 				}
-				last := &batch.Timeseries[len(batch.Timeseries)-1]
-				last.Samples = append(last.Samples, prompb.Sample{Timestamp: timestamp, Value: value})
+				batch.Timeseries = append(batch.Timeseries, prompb.TimeSeries{
+					Labels:  samples.BuildSeriesLabels(config.Name, series.Series, config.ReplicaInsertIndex, churn, epoch, options.Replica),
+					Samples: []prompb.Sample{{Timestamp: timestamp, Value: value}},
+				})
 				summary.ActualSamples++
 				batchSamples++
 				if batchSamples == options.MaxSamples {
@@ -227,12 +229,12 @@ func Generate(ctx context.Context, configPath, output string, options Options) (
 						return false
 					}
 				}
+				seriesIndex++
+				return true
+			})
+			if err != nil {
+				return nil, err
 			}
-			seriesIndex++
-			return true
-		})
-		if err != nil {
-			return nil, err
 		}
 	}
 	if err := flush(); err != nil {
@@ -256,8 +258,7 @@ func Generate(ctx context.Context, configPath, output string, options Options) (
 	return summary, nil
 }
 
-// Verify decodes each request and checks counts and per-series timestamps using
-// bounded memory. Series-major files allow continuing a series across batches.
+// Verify decodes each request and checks counts and timestamp-major ordering.
 func Verify(ctx context.Context, root string) (*Summary, error) {
 	data, err := os.ReadFile(filepath.Join(root, "summary.json"))
 	if err != nil {
@@ -273,6 +274,12 @@ func Verify(ctx context.Context, root string) (*Summary, error) {
 	if err := summary.Options.Validate(); err != nil {
 		return nil, err
 	}
+	if summary.SampleOrder != TimestampMajor {
+		return nil, fmt.Errorf("unsupported sample order %q", summary.SampleOrder)
+	}
+	if summary.BaseSeries <= 0 || summary.BaseSeries > math.MaxInt64/summary.Options.SamplesPerSeries() {
+		return nil, fmt.Errorf("invalid base series count")
+	}
 	if summary.ConfigSHA256 != jsonDigest(summary.Metrics) {
 		return nil, fmt.Errorf("config inventory digest mismatch")
 	}
@@ -283,16 +290,11 @@ func Verify(ctx context.Context, root string) (*Summary, error) {
 	if len(entries) != len(summary.Files)+1 || len(summary.Files) == 0 {
 		return nil, fmt.Errorf("missing or unexpected dataset files")
 	}
-	actualSamples, actualSeries, baseSeries, totalBytes := int64(0), int64(0), int64(0), int64(0)
-	baseKey, lastKey := "", ""
-	seriesSamples := int64(0)
-	metricCounts := map[string]int64{}
-	finishSeries := func() error {
-		if baseKey != "" && seriesSamples != summary.Options.SamplesPerSeries() {
-			return fmt.Errorf("incomplete base series: got %d samples", seriesSamples)
-		}
-		return nil
+	scrapes, err := newScrapeVerifier(&summary)
+	if err != nil {
+		return nil, err
 	}
+	actualSamples, totalBytes := int64(0), int64(0)
 	for i, file := range summary.Files {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -351,46 +353,28 @@ func Verify(ctx context.Context, root string) (*Summary, error) {
 			if !replicaFound {
 				return nil, fmt.Errorf("missing or incorrect replica label")
 			}
-			nextBase := jsonDigest(base)
-			key := jsonDigest(series.Labels)
-			if nextBase != baseKey {
-				if err := finishSeries(); err != nil {
-					return nil, err
-				}
-				baseKey = nextBase
-				seriesSamples = 0
-				baseSeries++
-				metricCounts[name]++
+			if err := scrapes.observe(base, series, name); err != nil {
+				return nil, fmt.Errorf("%s: %w", file.Name, err)
 			}
-			if key != lastKey {
-				actualSeries++
-				lastKey = key
-			}
-			for _, sample := range series.Samples {
-				expected := summary.Options.Start.UnixMilli() + seriesSamples*summary.Options.IntervalMillis
-				if sample.Timestamp != expected || sample.Timestamp >= summary.Options.End.UnixMilli() || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
-					return nil, fmt.Errorf("invalid value or timestamp in %s", file.Name)
-				}
-				seriesSamples++
-				actualSamples++
-				fileSamples++
-			}
+			actualSamples++
+			fileSamples++
 		}
 		if fileSamples != file.Samples || fileSamples == 0 || fileSamples > int64(summary.Options.MaxSamples) {
 			return nil, fmt.Errorf("invalid sample count in %s", file.Name)
 		}
 		totalBytes += file.Bytes
 	}
-	if err := finishSeries(); err != nil {
+	if err := scrapes.finish(); err != nil {
 		return nil, err
 	}
+	metricCounts := scrapes.metricCounts
 	for _, metric := range summary.Metrics {
 		if metricCounts[metric.Name] != metric.Series {
 			return nil, fmt.Errorf("metric %s series count mismatch", metric.Name)
 		}
 		delete(metricCounts, metric.Name)
 	}
-	if len(metricCounts) != 0 || actualSamples != summary.ActualSamples || actualSeries != summary.ActualSeries || baseSeries != summary.BaseSeries || totalBytes != summary.RemoteWriteTotalBytes || len(summary.Files) != summary.RemoteWriteFiles {
+	if len(metricCounts) != 0 || actualSamples != summary.ActualSamples || scrapes.actualSeries != summary.ActualSeries || totalBytes != summary.RemoteWriteTotalBytes || len(summary.Files) != summary.RemoteWriteFiles {
 		return nil, fmt.Errorf("dataset totals disagree with manifest")
 	}
 	return &summary, nil
