@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -27,14 +26,6 @@ func decode(t *testing.T, root string, limit int) map[string][]prompb.Sample {
 		t.Fatal(err)
 	}
 	sort.Strings(paths)
-	manifest, err := os.ReadFile(filepath.Join(root, "summary.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var summary dataset.Summary
-	if err := json.Unmarshal(manifest, &summary); err != nil {
-		t.Fatal(err)
-	}
 	previousTimestamp := int64(-1)
 	result := map[string][]prompb.Sample{}
 	for _, path := range paths {
@@ -52,12 +43,10 @@ func decode(t *testing.T, root string, limit int) map[string][]prompb.Sample {
 		}
 		count := 0
 		for _, series := range request.Timeseries {
-			if summary.SampleOrder == dataset.TimestampMajor {
-				if len(series.Samples) != 1 || series.Samples[0].Timestamp < previousTimestamp {
-					t.Fatal("wire samples are not timestamp-major")
-				}
-				previousTimestamp = series.Samples[0].Timestamp
+			if len(series.Samples) != 1 || series.Samples[0].Timestamp < previousTimestamp {
+				t.Fatal("wire samples are not timestamp-major")
 			}
+			previousTimestamp = series.Samples[0].Timestamp
 			labels, _ := json.Marshal(series.Labels)
 			key := string(labels)
 			result[key] = append(result[key], series.Samples...)
@@ -152,35 +141,6 @@ func TestDatasetRoundTrip(t *testing.T) {
 				t.Fatal("missing timestamp-major contract")
 			}
 			decoded := decode(t, first, 5)
-			if scenario.name == "partial" {
-				// Captured with the original series-major generator at 4e02dc5.
-				legacy := filepath.Join("testdata", "legacy-series-major")
-				if _, err := dataset.Verify(context.Background(), legacy); err != nil {
-					t.Fatal(err)
-				}
-				previous := decode(t, legacy, 1000)
-				if len(decoded) != len(previous) {
-					t.Fatal("legacy series count changed")
-				}
-				for labels, expected := range previous {
-					actual := decoded[labels]
-					if len(actual) != len(expected) {
-						t.Fatalf("legacy sample count changed for %s", labels)
-					}
-					for i, point := range actual {
-						valueMatches := point.Value == expected[i].Value
-						if strings.Contains(labels, `"value":"noisy"`) {
-							// The ARM64 fixture uses fused multiply/subtract in Noisy.Next;
-							// AMD64 rounds the operations separately. Allow only the tiny
-							// accumulated rounding difference in this cross-platform fixture.
-							valueMatches = math.Abs(point.Value-expected[i].Value) <= 1e-14
-						}
-						if point.Timestamp != expected[i].Timestamp || !valueMatches {
-							t.Errorf("legacy sample mismatch for %s at index %d: got %.17g @ %d, want %.17g @ %d", labels, i, point.Value, point.Timestamp, expected[i].Value, expected[i].Timestamp)
-						}
-					}
-				}
-			}
 			if verified.BaseSeries != 16 || verified.ActualSamples != 96 || verified.ActualSeries != scenario.unique || int64(len(decoded)) != scenario.unique {
 				t.Fatalf("unexpected dataset counts: %+v, decoded=%d", verified, len(decoded))
 			}
@@ -268,6 +228,59 @@ func TestDatasetRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(out, "summary.json")); !os.IsNotExist(err) {
 		t.Fatal("canceled generation published a summary")
+	}
+}
+
+func TestVerifyRejectsInvalidSampleOrder(t *testing.T) {
+	config := fixture(t)
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, scenario := range []struct {
+		name  string
+		order string
+		omit  bool
+	}{
+		{name: "missing", omit: true},
+		{name: "empty"},
+		{name: "unknown", order: "unknown"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			output := t.TempDir()
+			summary, err := dataset.Generate(context.Background(), config, output, dataset.Options{
+				Start: start, End: start.Add(time.Second), IntervalMillis: 1000, MaxSamples: 10,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary.SampleOrder = scenario.order
+			// Recompute the canonical identity to reach ordering validation.
+			summary.DatasetID, summary.GenerationDurationSeconds = "", 0
+			identity, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary.DatasetID = fmt.Sprintf("%x", sha256.Sum256(identity))
+			manifest, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario.omit {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(manifest, &fields); err != nil {
+					t.Fatal(err)
+				}
+				delete(fields, "sample_order")
+				manifest, err = json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(output, "summary.json"), manifest, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := dataset.Verify(context.Background(), output); err == nil || !strings.Contains(err.Error(), "unsupported sample order") {
+				t.Fatalf("expected unsupported sample order, got %v", err)
+			}
+		})
 	}
 }
 

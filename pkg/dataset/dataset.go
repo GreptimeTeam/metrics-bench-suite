@@ -110,7 +110,7 @@ type Summary struct {
 	RemoteWriteTotalBytes     int64     `json:"remote_write_total_bytes"`
 	Files                     []File    `json:"files"`
 	GenerationDurationSeconds float64   `json:"generation_duration_seconds"`
-	SampleOrder               string    `json:"sample_order,omitempty"`
+	SampleOrder               string    `json:"sample_order"`
 }
 
 func (s Summary) identity() string {
@@ -258,8 +258,7 @@ func Generate(ctx context.Context, configPath, output string, options Options) (
 	return summary, nil
 }
 
-// Verify decodes each request and checks counts and ordering. Legacy datasets
-// without sample_order retain their series-major verification contract.
+// Verify decodes each request and checks counts and timestamp-major ordering.
 func Verify(ctx context.Context, root string) (*Summary, error) {
 	data, err := os.ReadFile(filepath.Join(root, "summary.json"))
 	if err != nil {
@@ -275,7 +274,7 @@ func Verify(ctx context.Context, root string) (*Summary, error) {
 	if err := summary.Options.Validate(); err != nil {
 		return nil, err
 	}
-	if summary.SampleOrder != "" && summary.SampleOrder != TimestampMajor {
+	if summary.SampleOrder != TimestampMajor {
 		return nil, fmt.Errorf("unsupported sample order %q", summary.SampleOrder)
 	}
 	if summary.BaseSeries <= 0 || summary.BaseSeries > math.MaxInt64/summary.Options.SamplesPerSeries() {
@@ -291,23 +290,11 @@ func Verify(ctx context.Context, root string) (*Summary, error) {
 	if len(entries) != len(summary.Files)+1 || len(summary.Files) == 0 {
 		return nil, fmt.Errorf("missing or unexpected dataset files")
 	}
-	var scrapes *scrapeVerifier
-	if summary.SampleOrder == TimestampMajor {
-		scrapes, err = newScrapeVerifier(&summary)
-		if err != nil {
-			return nil, err
-		}
+	scrapes, err := newScrapeVerifier(&summary)
+	if err != nil {
+		return nil, err
 	}
-	actualSamples, actualSeries, baseSeries, totalBytes := int64(0), int64(0), int64(0), int64(0)
-	baseKey, lastKey := "", ""
-	seriesSamples := int64(0)
-	metricCounts := map[string]int64{}
-	finishSeries := func() error {
-		if baseKey != "" && seriesSamples != summary.Options.SamplesPerSeries() {
-			return fmt.Errorf("incomplete base series: got %d samples", seriesSamples)
-		}
-		return nil
-	}
+	actualSamples, totalBytes := int64(0), int64(0)
 	for i, file := range summary.Files {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -366,61 +353,28 @@ func Verify(ctx context.Context, root string) (*Summary, error) {
 			if !replicaFound {
 				return nil, fmt.Errorf("missing or incorrect replica label")
 			}
-			if scrapes != nil {
-				if err := scrapes.observe(base, series, name); err != nil {
-					return nil, fmt.Errorf("%s: %w", file.Name, err)
-				}
-				actualSamples++
-				fileSamples++
-				continue
+			if err := scrapes.observe(base, series, name); err != nil {
+				return nil, fmt.Errorf("%s: %w", file.Name, err)
 			}
-			nextBase := jsonDigest(base)
-			key := jsonDigest(series.Labels)
-			if nextBase != baseKey {
-				if err := finishSeries(); err != nil {
-					return nil, err
-				}
-				baseKey = nextBase
-				seriesSamples = 0
-				baseSeries++
-				metricCounts[name]++
-			}
-			if key != lastKey {
-				actualSeries++
-				lastKey = key
-			}
-			for _, sample := range series.Samples {
-				expected := summary.Options.Start.UnixMilli() + seriesSamples*summary.Options.IntervalMillis
-				if sample.Timestamp != expected || sample.Timestamp >= summary.Options.End.UnixMilli() || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
-					return nil, fmt.Errorf("invalid value or timestamp in %s", file.Name)
-				}
-				seriesSamples++
-				actualSamples++
-				fileSamples++
-			}
+			actualSamples++
+			fileSamples++
 		}
 		if fileSamples != file.Samples || fileSamples == 0 || fileSamples > int64(summary.Options.MaxSamples) {
 			return nil, fmt.Errorf("invalid sample count in %s", file.Name)
 		}
 		totalBytes += file.Bytes
 	}
-	if err := finishSeries(); err != nil {
+	if err := scrapes.finish(); err != nil {
 		return nil, err
 	}
-	if scrapes != nil {
-		if err := scrapes.finish(); err != nil {
-			return nil, err
-		}
-		baseSeries, actualSeries = summary.BaseSeries, scrapes.actualSeries
-		metricCounts = scrapes.metricCounts
-	}
+	metricCounts := scrapes.metricCounts
 	for _, metric := range summary.Metrics {
 		if metricCounts[metric.Name] != metric.Series {
 			return nil, fmt.Errorf("metric %s series count mismatch", metric.Name)
 		}
 		delete(metricCounts, metric.Name)
 	}
-	if len(metricCounts) != 0 || actualSamples != summary.ActualSamples || actualSeries != summary.ActualSeries || baseSeries != summary.BaseSeries || totalBytes != summary.RemoteWriteTotalBytes || len(summary.Files) != summary.RemoteWriteFiles {
+	if len(metricCounts) != 0 || actualSamples != summary.ActualSamples || scrapes.actualSeries != summary.ActualSeries || totalBytes != summary.RemoteWriteTotalBytes || len(summary.Files) != summary.RemoteWriteFiles {
 		return nil, fmt.Errorf("dataset totals disagree with manifest")
 	}
 	return &summary, nil

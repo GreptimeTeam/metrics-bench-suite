@@ -82,14 +82,14 @@ exemplars, or native histograms.
 The dataset identity hashes the canonical Go JSON summary after clearing
 `dataset_id` and zeroing generation duration. It includes the binary identity and
 batch size: two different artifacts can contain equivalent logical samples.
-The optional `sample_order` field is part of the identity. An absent field means
-legacy series-first output, where global timestamps restart for each base series.
-`verify` still accepts those datasets with their original identities; generation
-only produces timestamp-first output. Unknown ordering values are rejected.
+The required `sample_order` field is part of the identity and must be
+`"timestamp-major"`. Generation and verification only support timestamp-first
+output. Missing or unknown ordering values are rejected. Old series-first
+datasets must be regenerated.
 Schema and CLI contract versions remain 1, and the remote-write encoding is
 unchanged. Older verifiers cannot verify the new manifests: their identity check
 rejects the additional ordering metadata. Use this version's verifier for new
-outputs. Existing datasets need no conversion.
+outputs.
 
 Absolute output/config locations are excluded. `version` reports executable
 identity for callers such as O11yBench.
@@ -126,8 +126,7 @@ python3 scripts/catalog_metrics_profiles.py --output /tmp/metrics-catalog.json
 
 Dataset tests independently decode the wire files and exercise all distributions,
 reproducibility, batch changes across scrape boundaries, resets, historical churn,
-cancellation, legacy compatibility, and corrupt/incomplete output. A tiny frozen
-legacy fixture checks that logical samples remain unchanged across ordering modes;
-semantic corruption tests rebuild integrity metadata before verification. See
+cancellation, invalid ordering metadata, and corrupt/incomplete output.
+Semantic corruption tests rebuild integrity metadata before verification. See
 [the profile catalog](../../profiles/README.md) for corrected curated values,
 source lineage, and known invalid legacy collections.
