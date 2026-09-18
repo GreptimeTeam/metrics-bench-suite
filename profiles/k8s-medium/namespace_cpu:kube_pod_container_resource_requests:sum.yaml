@@ -38,5 +38,5 @@ fields:
       type: Float
       dist:
         type: uniform
-        lower_bound: 0
+        lower_bound: 1
         upper_bound: 1000

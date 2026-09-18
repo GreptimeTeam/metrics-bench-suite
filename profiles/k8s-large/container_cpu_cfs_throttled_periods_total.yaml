@@ -20,12 +20,8 @@ tags:
     - name: env
       type: String
       dist:
-        type: weighted_preset
-        preset:
-            - value: env0
-              weight: 1
-            - value: env1
-              weight: 1
+        type: constant_string
+        value: qa
     - name: holiday
       type: String
       dist:
@@ -101,4 +97,4 @@ fields:
       dist:
         type: mono_inc
         lower_bound: 0
-        step: 10
+        step: 1

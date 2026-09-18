@@ -7,6 +7,11 @@ tags:
       dist:
         type: constant_string
         value: eks-us-east-1-qa1
+    - name: container
+      type: String
+      dist:
+        type: constant_string
+        value: container0
     - name: env
       type: String
       dist:
@@ -23,6 +28,12 @@ tags:
         type: replica_string
         replica: 20
         replica_prefix: app-
+    - name: node
+      type: String
+      dist:
+        type: replica_string
+        replica: 8
+        replica_prefix: node-
     - name: pod
       type: String
       dist:
@@ -39,19 +50,10 @@ tags:
       dist:
         type: constant_string
         value: prometheus-prometheus-kube-prometheus-prometheus-0
-    - name: workload
-      type: String
-      dist:
-        type: constant_string
-        value: workload-0
-    - name: workload_type
-      type: String
-      dist:
-        type: constant_string
-        value: deployment
 fields:
     - name: greptime_value
       type: Float
       dist:
-        type: constant_float
-        value: 1.0
+        type: uniform
+        lower_bound: 0
+        upper_bound: 16
