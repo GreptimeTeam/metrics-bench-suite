@@ -58,14 +58,22 @@ counter/gauge behavior.
 ## File contract, version 1
 
 Each `prw-000000000000.bin` file contains one protobuf `prompb.WriteRequest`
-compressed using Snappy block encoding. Load files in manifest order. Each base
-series is emitted in timestamp order; global timestamps restart for each base
-series. Long series and churn epochs can span files. The format contains scalar
-samples only, with no OTLP, remote-write v2, exemplars, or native histograms.
+compressed using Snappy block encoding. Load files in manifest order. New datasets
+emit **all series at one timestamp before advancing to the next timestamp**, in
+stable metric-name and label-permutation order, simulating successive scrapes.
+Each protobuf time-series entry contains one sample; the same labels can appear
+again later in a request at a subsequent timestamp. Requests fill to
+`--max-samples-per-request`, so a scrape can span files and a file can contain
+multiple scrapes. Only the final request may be partially filled. Generation
+uses historical timestamps without waiting for wall-clock scrape intervals.
+
+The format contains scalar samples only, with no OTLP, remote-write v2,
+exemplars, or native histograms.
 
 `summary.json` contains:
 
 - schema/format versions, generator revision, dirty-build flag, and executable SHA-256;
+- `sample_order: "timestamp-major"` for newly generated datasets;
 - resolved options, configuration digest, per-file config hashes, metrics, and label cardinalities;
 - base-series count, distinct emitted identities including churn, actual samples;
 - ordered output filenames, sample counts, byte sizes, and SHA-256 hashes;
@@ -74,19 +82,40 @@ samples only, with no OTLP, remote-write v2, exemplars, or native histograms.
 The dataset identity hashes the canonical Go JSON summary after clearing
 `dataset_id` and zeroing generation duration. It includes the binary identity and
 batch size: two different artifacts can contain equivalent logical samples.
+The optional `sample_order` field is part of the identity. An absent field means
+legacy series-first output, where global timestamps restart for each base series.
+`verify` still accepts those datasets with their original identities; generation
+only produces timestamp-first output. Unknown ordering values are rejected.
+Schema and CLI contract versions remain 1, and the remote-write encoding is
+unchanged. Older verifiers cannot verify the new manifests: their identity check
+rejects the additional ordering metadata. Use this version's verifier for new
+outputs. Existing datasets need no conversion.
+
 Absolute output/config locations are excluded. `version` reports executable
 identity for callers such as O11yBench.
 
 `verify` checks manifest identity, all file checksums, decoded counts, finite
-values, ordered labels, replica identity, and complete per-base-series timestamp
-sequences. It rejects missing/extra files and unfinished datasets. A summary is
-published only after all output files finish; failed/interrupted outputs are
+values, ordered labels, replica identity, and complete timestamp sequences.
+For timestamp-first output, it also checks exactly one sample per series entry,
+complete scrapes, stable base-series order without duplicates, and the expected
+churn selection and epochs. It rejects missing/extra files and unfinished datasets.
+A summary is published only after all output files finish; failed/interrupted outputs are
 left for diagnosis and cannot be reused as complete datasets.
 
-Generation retains one series' field state and one bounded batch, plus config
-label candidates and output-file metadata. It does not allocate the complete
-series product or a generator for every series. `inspect` computes cardinality
-without expanding label candidates.
+Generation retains each base series' field/random state and one bounded batch,
+plus config label candidates and output-file metadata. It regenerates label
+combinations for each scrape rather than retaining the complete label product,
+and never retains sample history. Memory therefore grows with series cardinality
+and request size, plus the file inventory, rather than all generated samples.
+This uses more field-state memory than legacy series-first generation while
+preserving the same per-series random values and stateful distributions.
+Verification retains one fingerprint per base series, with a uniqueness set
+during the first scrape, instead of historical samples or churn identities.
+`inspect` still computes cardinality without expanding label candidates.
+
+Compressed size is not guaranteed to decrease: timestamp-first output repeats
+labels per sample, but avoids making the distance between successive series'
+samples depend on the total dataset duration.
 
 ## Validation
 
@@ -96,6 +125,9 @@ python3 scripts/catalog_metrics_profiles.py --output /tmp/metrics-catalog.json
 ```
 
 Dataset tests independently decode the wire files and exercise all distributions,
-reproducibility, batch changes, resets, historical churn, cancellation, and
-corrupt/incomplete output. See [the profile catalog](../../profiles/README.md)
-for corrected curated values, source lineage, and known invalid legacy collections.
+reproducibility, batch changes across scrape boundaries, resets, historical churn,
+cancellation, legacy compatibility, and corrupt/incomplete output. A tiny frozen
+legacy fixture checks that logical samples remain unchanged across ordering modes;
+semantic corruption tests rebuild integrity metadata before verification. See
+[the profile catalog](../../profiles/README.md) for corrected curated values,
+source lineage, and known invalid legacy collections.

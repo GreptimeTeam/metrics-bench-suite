@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "format": "prometheus-remote-write-v1-snappy",
+  "dataset_id": "177237377f54bce65f95d28c0a8a4c5c4b7a8b5f8675e2f217ecf0b366b56c17",
+  "generator": {
+    "contract_version": 1,
+    "revision": "4e02dc5dc840188d0410cd83990ce360bc0ae31b",
+    "modified": false,
+    "binary_sha256": "c966b755bb0c5fef8670ca3a9b2ba3d39277d1c2d3c47030cc91883b012748a2"
+  },
+  "options": {
+    "profile": "",
+    "start": "2025-01-01T00:00:00Z",
+    "end": "2025-01-01T00:00:11Z",
+    "interval_ms": 2000,
+    "seed": 42,
+    "replica": 7,
+    "churn_rate": 0.5,
+    "churn_interval_ms": 4000,
+    "max_samples_per_request": 1000
+  },
+  "config_sha256": "fd0fb2df69e48a3f3b07aa1efaad65e3a1b02dfe725e74e42f5ee7fc801a2399",
+  "metrics": [
+    {
+      "name": "constant",
+      "file": "constant.yaml",
+      "sha256": "d3ca843bab66b4c9be46897e72f1f100fc52e738fadfb644d1cb28111b42570a",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "constant_float"
+    },
+    {
+      "name": "counter",
+      "file": "counter.yaml",
+      "sha256": "fccfb88cb9ee1d715b468e7190e80a4f3ffe543d9147a33961172f4ca1951b28",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "mono_inc"
+    },
+    {
+      "name": "integer",
+      "file": "integer.yaml",
+      "sha256": "96bafcaeabb41f8fe3f77fad5fb7fb7d7626eb59358666124bd77871d90ccbd4",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "random_int"
+    },
+    {
+      "name": "noisy",
+      "file": "noisy.yaml",
+      "sha256": "a7381eb8dd73241b692e7f0d58d4826b1f7529b58531f9d9027f68cd444d4506",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "noisy"
+    },
+    {
+      "name": "normal",
+      "file": "normal.yaml",
+      "sha256": "b1bd42cb0387372e8fcdffefcfcce303f33e72fe536e4a0c5ce932d96040b82f",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "normal"
+    },
+    {
+      "name": "periodic",
+      "file": "periodic.yaml",
+      "sha256": "a5f73f7ec9c38d83ac66625a72564e0f4a12cb3f143dafcc4b6bd1cf08c81de8",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "periodic"
+    },
+    {
+      "name": "random",
+      "file": "random.yaml",
+      "sha256": "a0471f8ff488496e6fc447840646739242c3c6ec4b6925f53f0a4b69e48aea31",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "random_float"
+    },
+    {
+      "name": "uniform",
+      "file": "uniform.yaml",
+      "sha256": "53590dd6ef290b826594f44f518a4b797d745ba2816f661b6dade532188aafa7",
+      "series": 2,
+      "label_cardinality": {
+        "Zone": 1,
+        "host": 2,
+        "optional": 1
+      },
+      "value_distribution": "uniform"
+    }
+  ],
+  "base_series": 16,
+  "actual_series": 32,
+  "actual_samples": 96,
+  "remote_write_files": 1,
+  "remote_write_total_bytes": 1159,
+  "files": [
+    {
+      "name": "prw-000000000000.bin",
+      "bytes": 1159,
+      "sha256": "ae123b09f124cbf35f1fe159d89465ec1b1c531f95acb053e3cf391ed41e777d",
+      "samples": 96
+    }
+  ],
+  "generation_duration_seconds": 0.000257125
+}
