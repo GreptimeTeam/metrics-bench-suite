@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -157,8 +158,27 @@ func TestDatasetRoundTrip(t *testing.T) {
 				if _, err := dataset.Verify(context.Background(), legacy); err != nil {
 					t.Fatal(err)
 				}
-				if !reflect.DeepEqual(decoded, decode(t, legacy, 1000)) {
-					t.Fatal("timestamp-major generation changed legacy logical samples")
+				previous := decode(t, legacy, 1000)
+				if len(decoded) != len(previous) {
+					t.Fatal("legacy series count changed")
+				}
+				for labels, expected := range previous {
+					actual := decoded[labels]
+					if len(actual) != len(expected) {
+						t.Fatalf("legacy sample count changed for %s", labels)
+					}
+					for i, point := range actual {
+						valueMatches := point.Value == expected[i].Value
+						if strings.Contains(labels, `"value":"noisy"`) {
+							// The ARM64 fixture uses fused multiply/subtract in Noisy.Next;
+							// AMD64 rounds the operations separately. Allow only the tiny
+							// accumulated rounding difference in this cross-platform fixture.
+							valueMatches = math.Abs(point.Value-expected[i].Value) <= 1e-14
+						}
+						if point.Timestamp != expected[i].Timestamp || !valueMatches {
+							t.Errorf("legacy sample mismatch for %s at index %d: got %.17g @ %d, want %.17g @ %d", labels, i, point.Value, point.Timestamp, expected[i].Value, expected[i].Timestamp)
+						}
+					}
 				}
 			}
 			if verified.BaseSeries != 16 || verified.ActualSamples != 96 || verified.ActualSeries != scenario.unique || int64(len(decoded)) != scenario.unique {
